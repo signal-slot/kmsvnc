@@ -9,12 +9,11 @@ drm-ffi = "0.9"
 drm-fourcc = "2.2"
 rustix = { version = "0.38", features = ["mm"] }
 input-linux = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "sync", "signal"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
-thiserror = "1"
 des = "0.8"
 cipher = "0.4"
 rand = "0.8"
