@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use cipher::{BlockEncrypt, KeyInit};
+use des::Des;
+use rand::Rng;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -149,6 +152,54 @@ const PIXEL_FORMAT: [u8; 16] = [
     0, 0, 0, // padding
 ];
 
+/// Compute the VNC DES response for a given password and 16-byte challenge.
+///
+/// VNC DES key derivation (VNC-specific):
+/// 1. Password is truncated/zero-padded to 8 bytes
+/// 2. Each byte's bit order is reversed (MSB <-> LSB)
+/// 3. DES ECB encrypts the 16-byte challenge as two 8-byte blocks
+fn vnc_des_auth(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
+    let mut key_bytes = [0u8; 8];
+    for (i, &b) in password.as_bytes().iter().take(8).enumerate() {
+        key_bytes[i] = b;
+    }
+    // Reverse bit order of each byte (VNC-specific quirk)
+    for byte in &mut key_bytes {
+        *byte = byte.reverse_bits();
+    }
+
+    let cipher = Des::new_from_slice(&key_bytes).expect("DES key is always 8 bytes");
+
+    let mut result = [0u8; 16];
+    result.copy_from_slice(challenge);
+
+    let (block0, block1) = result.split_at_mut(8);
+    cipher.encrypt_block(block0.into());
+    cipher.encrypt_block(block1.into());
+
+    result
+}
+
+/// Perform VNC Authentication (Type 2) challenge-response.
+/// Returns Ok(true) if auth succeeded, Ok(false) if failed.
+async fn perform_vnc_auth(stream: &mut TcpStream, password: &str) -> Result<bool> {
+    let challenge: [u8; 16] = rand::thread_rng().gen();
+
+    stream
+        .write_all(&challenge)
+        .await
+        .context("send VNC auth challenge")?;
+
+    let mut response = [0u8; 16];
+    stream
+        .read_exact(&mut response)
+        .await
+        .context("read VNC auth response")?;
+
+    let expected = vnc_des_auth(password, &challenge);
+    Ok(response == expected)
+}
+
 /// Handle a single VNC client connection.
 pub async fn handle_client(
     mut stream: TcpStream,
@@ -156,6 +207,7 @@ pub async fn handle_client(
     height: u16,
     mut frame_rx: watch::Receiver<Arc<Vec<u8>>>,
     input_tx: mpsc::Sender<InputEvent>,
+    password: Option<&str>,
 ) -> Result<()> {
     // === RFB Handshake ===
 
@@ -182,48 +234,116 @@ pub async fn handle_client(
     match rfb_minor {
         // RFB 3.3 (and older): server dictates security type as u32, no SecurityResult.
         0..=6 => {
-            stream
-                .write_all(&1u32.to_be_bytes())
-                .await
-                .context("send security type (3.3)")?;
+            if let Some(pw) = password {
+                // Type 2: VNC Authentication
+                stream
+                    .write_all(&2u32.to_be_bytes())
+                    .await
+                    .context("send security type 2 (3.3)")?;
+                if !perform_vnc_auth(&mut stream, pw).await? {
+                    // RFB 3.3: no SecurityResult, just close the connection
+                    bail!("VNC authentication failed");
+                }
+            } else {
+                stream
+                    .write_all(&1u32.to_be_bytes())
+                    .await
+                    .context("send security type (3.3)")?;
+            }
         }
         // RFB 3.7: security type list + client selection, but no SecurityResult.
         7 => {
-            stream
-                .write_all(&[1, 1])
-                .await
-                .context("send security types (3.7)")?;
+            if let Some(pw) = password {
+                stream
+                    .write_all(&[1, 2])
+                    .await
+                    .context("send security types (3.7)")?;
 
-            let mut sec_type = [0u8; 1];
-            stream
-                .read_exact(&mut sec_type)
-                .await
-                .context("read security type selection (3.7)")?;
-            if sec_type[0] != 1 {
-                bail!("Client selected unsupported security type {}", sec_type[0]);
+                let mut sec_type = [0u8; 1];
+                stream
+                    .read_exact(&mut sec_type)
+                    .await
+                    .context("read security type selection (3.7)")?;
+                if sec_type[0] != 2 {
+                    bail!("Client selected unsupported security type {}", sec_type[0]);
+                }
+                if !perform_vnc_auth(&mut stream, pw).await? {
+                    bail!("VNC authentication failed");
+                }
+            } else {
+                stream
+                    .write_all(&[1, 1])
+                    .await
+                    .context("send security types (3.7)")?;
+
+                let mut sec_type = [0u8; 1];
+                stream
+                    .read_exact(&mut sec_type)
+                    .await
+                    .context("read security type selection (3.7)")?;
+                if sec_type[0] != 1 {
+                    bail!("Client selected unsupported security type {}", sec_type[0]);
+                }
             }
         }
         // RFB 3.8+: security type list + client selection + SecurityResult.
         _ => {
-            stream
-                .write_all(&[1, 1])
-                .await
-                .context("send security types")?;
+            if let Some(pw) = password {
+                stream
+                    .write_all(&[1, 2])
+                    .await
+                    .context("send security types")?;
 
-            let mut sec_type = [0u8; 1];
-            stream
-                .read_exact(&mut sec_type)
-                .await
-                .context("read security type selection")?;
-            if sec_type[0] != 1 {
-                bail!("Client selected unsupported security type {}", sec_type[0]);
+                let mut sec_type = [0u8; 1];
+                stream
+                    .read_exact(&mut sec_type)
+                    .await
+                    .context("read security type selection")?;
+                if sec_type[0] != 2 {
+                    bail!("Client selected unsupported security type {}", sec_type[0]);
+                }
+
+                if perform_vnc_auth(&mut stream, pw).await? {
+                    // SecurityResult: OK
+                    stream
+                        .write_all(&0u32.to_be_bytes())
+                        .await
+                        .context("send security result")?;
+                } else {
+                    // SecurityResult: Failed
+                    stream
+                        .write_all(&1u32.to_be_bytes())
+                        .await
+                        .context("send security result (failed)")?;
+                    let reason = b"Authentication failed";
+                    stream
+                        .write_all(&(reason.len() as u32).to_be_bytes())
+                        .await
+                        .ok();
+                    stream.write_all(reason).await.ok();
+                    bail!("VNC authentication failed");
+                }
+            } else {
+                stream
+                    .write_all(&[1, 1])
+                    .await
+                    .context("send security types")?;
+
+                let mut sec_type = [0u8; 1];
+                stream
+                    .read_exact(&mut sec_type)
+                    .await
+                    .context("read security type selection")?;
+                if sec_type[0] != 1 {
+                    bail!("Client selected unsupported security type {}", sec_type[0]);
+                }
+
+                // SecurityResult: OK
+                stream
+                    .write_all(&0u32.to_be_bytes())
+                    .await
+                    .context("send security result")?;
             }
-
-            // SecurityResult: OK
-            stream
-                .write_all(&0u32.to_be_bytes())
-                .await
-                .context("send security result")?;
         }
     }
 

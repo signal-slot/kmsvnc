@@ -161,6 +161,9 @@ async fn main() -> Result<()> {
         input_loop(&mut input_rx, width, height).await
     });
 
+    // Share password across client tasks
+    let password = Arc::new(config.password);
+
     // VNC server listen loop
     let addr = format!("{}:{}", config.listen, config.port);
     let listener = TcpListener::bind(&addr)
@@ -183,10 +186,11 @@ async fn main() -> Result<()> {
                 tracing::info!("VNC client connected: {peer}");
                 let frame_rx = frame_rx.clone();
                 let input_tx = input_tx.clone();
+                let password = password.clone();
                 let w = width as u16;
                 let h = height as u16;
                 tokio::spawn(async move {
-                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, input_tx).await {
+                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, input_tx, password.as_deref()).await {
                         tracing::info!("Client {peer} disconnected: {e}");
                     }
                 });

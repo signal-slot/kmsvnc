@@ -18,4 +18,8 @@ pub struct Config {
     /// VNC listen address
     #[arg(short, long, default_value = "0.0.0.0")]
     pub listen: String,
+
+    /// VNC password for authentication (Type 2). No auth if omitted.
+    #[arg(long)]
+    pub password: Option<String>,
 }
