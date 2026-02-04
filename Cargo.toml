@@ -1,0 +1,17 @@
+[package]
+name = "kmsvnc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+drm = "0.14"
+drm-ffi = "0.9"
+drm-fourcc = "2.2"
+rustix = { version = "0.38", features = ["mm"] }
+input-linux = "0.7"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+thiserror = "1"
