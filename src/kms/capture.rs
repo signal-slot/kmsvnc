@@ -10,6 +10,13 @@ use rustix::mm::{self, MapFlags, ProtFlags};
 use super::card::Card;
 use super::pixel_format;
 
+fn exe_path() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| Some(p.display().to_string()))
+        .unwrap_or_else(|| "<binary>".into())
+}
+
 /// Active output: connector -> encoder -> CRTC chain.
 pub struct ActiveOutput {
     pub connector_name: String,
@@ -71,7 +78,8 @@ pub fn open_card() -> Result<(Card, Vec<ActiveOutput>)> {
     bail!(
         "No DRI card with active outputs found. \
          Ensure /dev/dri/card* exists and the process has CAP_SYS_ADMIN \
-         (try: sudo setcap cap_sys_admin+ep <binary>)"
+         (try: sudo setcap cap_sys_admin+ep {})",
+        exe_path()
     )
 }
 
@@ -183,10 +191,13 @@ fn capture_fb1(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: 
         .get_framebuffer(fb_handle)
         .context("GET_FB failed")?;
 
-    let gem_handle = info.buffer().context(
-        "No buffer handle from GET_FB. \
-         CAP_SYS_ADMIN is required (try: sudo setcap cap_sys_admin+ep <binary>)",
-    )?;
+    let gem_handle = info.buffer().with_context(|| {
+        format!(
+            "No buffer handle from GET_FB. \
+             CAP_SYS_ADMIN is required (try: sudo setcap cap_sys_admin+ep {})",
+            exe_path()
+        )
+    })?;
 
     let pitch = info.pitch();
     let bpp = info.bpp();

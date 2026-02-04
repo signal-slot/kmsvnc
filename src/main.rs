@@ -123,10 +123,13 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
         }
     }
 
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<binary>".into());
     bail!(
         "No usable capture device found. Tried all /dev/dri/card* (DRM) \
          and /dev/fb* (fbdev). Ensure a display is active and the process \
-         has CAP_SYS_ADMIN (try: sudo setcap cap_sys_admin+ep <binary>)"
+         has CAP_SYS_ADMIN (try: sudo setcap cap_sys_admin+ep {exe})"
     )
 }
 
@@ -293,9 +296,12 @@ async fn input_loop(input_rx: &mut mpsc::Receiver<InputEvent>, width: u32, heigh
 /// Check for required capabilities and permissions, warn early on problems.
 fn check_permissions() {
     if !has_cap_sys_admin() {
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<binary>".into());
         tracing::warn!(
             "Process lacks CAP_SYS_ADMIN — DRM framebuffer access will likely fail. \
-             Run as root or: sudo setcap cap_sys_admin+ep <binary>"
+             Run as root or: sudo setcap cap_sys_admin+ep {exe}"
         );
     }
 
