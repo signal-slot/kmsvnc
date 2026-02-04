@@ -13,6 +13,7 @@ A lightweight VNC server for Linux that captures the screen directly from the KM
 - **Incremental updates** — 64px tile-based dirty rectangle detection to reduce bandwidth
 - **Pixel format negotiation** — respects client `SetPixelFormat` requests (any bpp/endianness/shifts)
 - **Multiple DRM formats** — XRGB8888, ARGB8888, XBGR8888, ABGR8888, RGB565
+- **VNC authentication** — optional password-based authentication (RFB Security Type 2, DES challenge-response)
 
 ## Requirements
 
@@ -44,10 +45,11 @@ Then connect any VNC client to `localhost:5900`.
 ### Options
 
 ```
---device <path>    Capture device path: /dev/dri/card*, /dev/fb* (default: auto-detect)
---port <port>      VNC listen port (default: 5900)
---fps <fps>        Capture frame rate (default: 30)
---listen <addr>    Listen address (default: 0.0.0.0)
+--device <path>      Capture device path: /dev/dri/card*, /dev/fb* (default: auto-detect)
+--port <port>        VNC listen port (default: 5900)
+--fps <fps>          Capture frame rate (default: 30)
+--listen <addr>      Listen address (default: 0.0.0.0)
+--password <pass>    Require VNC password authentication (default: no auth)
 ```
 
 ### Logging
@@ -123,6 +125,6 @@ Run with `RUST_LOG=info` and check the "Client SetPixelFormat" log line. The ser
 ## Limitations
 
 - Raw encoding only (no compression — best used on LAN)
-- No authentication or encryption
+- No encryption (VNC authentication uses DES challenge-response but traffic is unencrypted — use SSH tunneling for security)
 - Uses the first connected display output
 - Clipboard forwarding not implemented
