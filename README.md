@@ -22,7 +22,13 @@ A lightweight VNC server for Linux that captures the screen directly from the KM
 - `/dev/uinput` write access (for input forwarding)
 - Rust toolchain (to build)
 
-## Building
+## Installation
+
+```bash
+cargo install --git https://github.com/signal-slot/kmsvnc.git
+```
+
+Or build from a local checkout:
 
 ```bash
 cargo build --release
@@ -32,12 +38,12 @@ cargo build --release
 
 ```bash
 # Run as root (simplest)
-sudo ./target/release/kmsvnc
+sudo kmsvnc
 
 # Or grant capabilities
-sudo setcap cap_sys_admin+ep ./target/release/kmsvnc
+sudo setcap cap_sys_admin+ep $(which kmsvnc)
 sudo usermod -aG input $USER  # for /dev/uinput access (re-login required)
-./target/release/kmsvnc
+kmsvnc
 ```
 
 Then connect any VNC client to `localhost:5900`.
