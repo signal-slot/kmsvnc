@@ -170,26 +170,62 @@ pub async fn handle_client(
         .await
         .context("read client version")?;
 
-    // Security types: 1 type, type=1 (None)
-    stream
-        .write_all(&[1, 1])
-        .await
-        .context("send security types")?;
+    // Parse client version to determine the RFB minor version.
+    // Format: "RFB 003.MMM\n"
+    let rfb_minor = std::str::from_utf8(&ver_buf)
+        .ok()
+        .and_then(|s| s.get(8..11))
+        .and_then(|m| m.parse::<u16>().ok())
+        .unwrap_or(8);
+    tracing::info!("Client requested RFB 003.{:03}", rfb_minor);
 
-    let mut sec_type = [0u8; 1];
-    stream
-        .read_exact(&mut sec_type)
-        .await
-        .context("read security type selection")?;
-    if sec_type[0] != 1 {
-        bail!("Client selected unsupported security type {}", sec_type[0]);
+    match rfb_minor {
+        // RFB 3.3 (and older): server dictates security type as u32, no SecurityResult.
+        0..=6 => {
+            stream
+                .write_all(&1u32.to_be_bytes())
+                .await
+                .context("send security type (3.3)")?;
+        }
+        // RFB 3.7: security type list + client selection, but no SecurityResult.
+        7 => {
+            stream
+                .write_all(&[1, 1])
+                .await
+                .context("send security types (3.7)")?;
+
+            let mut sec_type = [0u8; 1];
+            stream
+                .read_exact(&mut sec_type)
+                .await
+                .context("read security type selection (3.7)")?;
+            if sec_type[0] != 1 {
+                bail!("Client selected unsupported security type {}", sec_type[0]);
+            }
+        }
+        // RFB 3.8+: security type list + client selection + SecurityResult.
+        _ => {
+            stream
+                .write_all(&[1, 1])
+                .await
+                .context("send security types")?;
+
+            let mut sec_type = [0u8; 1];
+            stream
+                .read_exact(&mut sec_type)
+                .await
+                .context("read security type selection")?;
+            if sec_type[0] != 1 {
+                bail!("Client selected unsupported security type {}", sec_type[0]);
+            }
+
+            // SecurityResult: OK
+            stream
+                .write_all(&0u32.to_be_bytes())
+                .await
+                .context("send security result")?;
+        }
     }
-
-    // SecurityResult: OK
-    stream
-        .write_all(&0u32.to_be_bytes())
-        .await
-        .context("send security result")?;
 
     // ClientInit
     let mut client_init = [0u8; 1];
