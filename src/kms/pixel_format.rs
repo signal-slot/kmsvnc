@@ -9,8 +9,9 @@ pub fn convert_to_bgra(
     format: DrmFourcc,
 ) -> Result<Vec<u8>, String> {
     match format {
-        DrmFourcc::Xrgb8888 => convert_xrgb8888(src, width, height, pitch),
-        DrmFourcc::Argb8888 => convert_argb8888(src, width, height, pitch),
+        // XRGB8888/ARGB8888 memory layout already matches VNC server format
+        // (32bpp depth=24 LE, R=16 G=8 B=0). The 4th byte is ignored (depth=24).
+        DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888 => copy_rows(src, width, height, pitch),
         DrmFourcc::Xbgr8888 => convert_xbgr8888(src, width, height, pitch),
         DrmFourcc::Abgr8888 => convert_abgr8888(src, width, height, pitch),
         DrmFourcc::Rgb565 => convert_rgb565(src, width, height, pitch),
@@ -18,38 +19,22 @@ pub fn convert_to_bgra(
     }
 }
 
-/// XRGB8888: memory layout [B, G, R, X] per pixel (little-endian u32 = 0xXXRRGGBB)
-/// Output BGRA: [B, G, R, 0xFF]
-fn convert_xrgb8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<Vec<u8>, String> {
-    let mut dst = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        let row = &src[(y * pitch) as usize..];
-        for x in 0..width as usize {
-            let off = x * 4;
-            dst.push(row[off]); // B
-            dst.push(row[off + 1]); // G
-            dst.push(row[off + 2]); // R
-            dst.push(0xFF); // A
+/// Row-copy for formats whose memory layout matches VNC's BGRX byte order.
+/// Copies each row, stripping pitch padding. No per-pixel conversion needed.
+fn copy_rows(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<Vec<u8>, String> {
+    let row_bytes = (width * 4) as usize;
+    if pitch as usize == row_bytes {
+        // No padding — bulk copy
+        let total = row_bytes * height as usize;
+        Ok(src[..total].to_vec())
+    } else {
+        let mut dst = Vec::with_capacity(row_bytes * height as usize);
+        for y in 0..height as usize {
+            let row_start = y * pitch as usize;
+            dst.extend_from_slice(&src[row_start..row_start + row_bytes]);
         }
+        Ok(dst)
     }
-    Ok(dst)
-}
-
-/// ARGB8888: memory layout [B, G, R, A] per pixel (little-endian u32 = 0xAARRGGBB)
-/// Output BGRA: [B, G, R, 0xFF] (force opaque — VNC has no alpha channel)
-fn convert_argb8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<Vec<u8>, String> {
-    let mut dst = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        let row = &src[(y * pitch) as usize..];
-        for x in 0..width as usize {
-            let off = x * 4;
-            dst.push(row[off]); // B
-            dst.push(row[off + 1]); // G
-            dst.push(row[off + 2]); // R
-            dst.push(0xFF); // A (force opaque)
-        }
-    }
-    Ok(dst)
 }
 
 /// XBGR8888: memory layout [R, G, B, X] per pixel (little-endian u32 = 0xXXBBGGRR)

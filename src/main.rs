@@ -20,7 +20,7 @@ use kms::fbdev::FbdevCapture;
 use vnc::server::{self, InputEvent};
 
 /// A boxed capture function: each call returns one BGRA frame.
-type CaptureFn = Box<dyn Fn() -> Result<Vec<u8>> + Send>;
+type CaptureFn = Box<dyn FnMut() -> Result<Vec<u8>> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
@@ -29,12 +29,9 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let width = output.width;
     let height = output.height;
     tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
-    let initial = capture::capture_frame(&card, output)?;
-    let initial_data = initial.data;
-    let capture_fn: CaptureFn = Box::new(move || {
-        let frame = capture::capture_frame(&card, &outputs[0])?;
-        Ok(frame.data)
-    });
+    let mut capturer = capture::Capturer::new(card, output);
+    let initial_data = capturer.capture()?;
+    let capture_fn: CaptureFn = Box::new(move || capturer.capture());
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -73,12 +70,9 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             let width = output.width;
             let height = output.height;
             tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
-            let initial = capture::capture_frame(&card, output)?;
-            let initial_data = initial.data;
-            let capture_fn: CaptureFn = Box::new(move || {
-                let frame = capture::capture_frame(&card, &outputs[0])?;
-                Ok(frame.data)
-            });
+            let mut capturer = capture::Capturer::new(card, output);
+            let initial_data = capturer.capture()?;
+            let capture_fn: CaptureFn = Box::new(move || capturer.capture());
             return Ok((width, height, initial_data, capture_fn));
         }
         Err(drm_err) => {
@@ -196,7 +190,7 @@ async fn main() -> Result<()> {
 }
 
 fn capture_loop(
-    capture_fn: CaptureFn,
+    mut capture_fn: CaptureFn,
     frame_tx: watch::Sender<Arc<Vec<u8>>>,
     fps: u32,
     shutdown: Arc<AtomicBool>,

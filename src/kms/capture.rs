@@ -1,3 +1,4 @@
+use std::ffi::c_void;
 use std::fs;
 use std::os::fd::{AsFd, OwnedFd};
 use std::ptr;
@@ -24,15 +25,6 @@ pub struct ActiveOutput {
     pub width: u32,
     pub height: u32,
     pub fb_handle: framebuffer::Handle,
-}
-
-/// Captured frame in BGRA pixel format.
-#[allow(dead_code)]
-pub struct Frame {
-    pub width: u32,
-    pub height: u32,
-    /// BGRA pixel data, row-major, 4 bytes per pixel, no padding.
-    pub data: Vec<u8>,
 }
 
 /// Open the first DRI card that has connected outputs.
@@ -136,183 +128,292 @@ fn probe_outputs(card: &Card) -> Result<Vec<ActiveOutput>> {
     Ok(outputs)
 }
 
-/// Capture a single frame from the given output.
-pub fn capture_frame(card: &Card, output: &ActiveOutput) -> Result<Frame> {
-    // Re-read CRTC to get current framebuffer (may change due to page-flipping)
-    let crtc_info = card
-        .get_crtc(output.crtc_handle)
-        .context("Failed to get CRTC")?;
-    let fb_handle = crtc_info.framebuffer().unwrap_or(output.fb_handle);
+// ---------------------------------------------------------------------------
+// Persistent DRM capturer with mmap cache
+// ---------------------------------------------------------------------------
 
-    // Try GET_FB2 first for pixel format info, fall back to GET_FB
-    match capture_fb2(card, fb_handle, output.width, output.height) {
-        Ok(frame) => Ok(frame),
-        Err(fb2_err) => {
-            tracing::debug!("GET_FB2 failed ({fb2_err}), trying GET_FB");
-            capture_fb1(card, fb_handle, output.width, output.height)
-        }
-    }
+const MAX_CACHE_ENTRIES: usize = 4;
+
+struct CachedBuffer {
+    fb_key: u32,
+    gem_handle: drm::buffer::Handle,
+    ptr: *mut c_void,
+    size: usize,
+    format: DrmFourcc,
+    pitch: u32,
+    _prime_fd: Option<OwnedFd>,
 }
 
-fn capture_fb2(
-    card: &Card,
-    fb_handle: framebuffer::Handle,
+pub struct Capturer {
+    card: Card,
+    crtc_handle: crtc::Handle,
+    default_fb: framebuffer::Handle,
     width: u32,
     height: u32,
-) -> Result<Frame> {
-    let info = card
-        .get_planar_framebuffer(fb_handle)
-        .context("GET_FB2 failed")?;
+    use_fb2: Option<bool>,
+    use_prime: Option<bool>,
+    cache: Vec<CachedBuffer>,
+}
 
-    if let Some(modifier) = info.modifier() {
-        if modifier != DrmModifier::Linear {
-            bail!(
-                "Framebuffer has non-linear modifier ({modifier:?}); \
-                 tiled buffers cannot be read via mmap"
-            );
+// SAFETY: The mmap pointers in CachedBuffer are read-only and their backing
+// resources (prime fd or card fd) are kept alive by Capturer.
+unsafe impl Send for Capturer {}
+
+impl Capturer {
+    pub fn new(card: Card, output: &ActiveOutput) -> Self {
+        Self {
+            crtc_handle: output.crtc_handle,
+            default_fb: output.fb_handle,
+            width: output.width,
+            height: output.height,
+            use_fb2: None,
+            use_prime: None,
+            cache: Vec::new(),
+            card,
         }
     }
 
-    let gem_handle = info.buffers()[0].context("No buffer handle in framebuffer")?;
-    let pitch = info.pitches()[0];
-    let format = info.pixel_format();
-    tracing::debug!(
-        "FB2: format={format:?}, pitch={pitch}, modifier={:?}",
-        info.modifier()
-    );
+    pub fn capture(&mut self) -> Result<Vec<u8>> {
+        let crtc_info = self
+            .card
+            .get_crtc(self.crtc_handle)
+            .context("Failed to get CRTC")?;
+        let fb_handle = crtc_info.framebuffer().unwrap_or(self.default_fb);
+        let fb_key = u32::from(fb_handle);
 
-    let raw = mmap_gem_buffer(card, gem_handle, height, pitch)?;
-    let bgra = pixel_format::convert_to_bgra(&raw, width, height, pitch, format)
+        // Cache hit — read directly from persistent mmap
+        if let Some(entry) = self.cache.iter().find(|e| e.fb_key == fb_key) {
+            let raw =
+                unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
+            return pixel_format::convert_to_bgra(
+                raw,
+                self.width,
+                self.height,
+                entry.pitch,
+                entry.format,
+            )
+            .map_err(|e| anyhow::anyhow!(e));
+        }
+
+        // Cache miss — map the buffer
+        let entry = self.map_buffer(fb_handle)?;
+        let raw = unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
+        let result = pixel_format::convert_to_bgra(
+            raw,
+            self.width,
+            self.height,
+            entry.pitch,
+            entry.format,
+        )
         .map_err(|e| anyhow::anyhow!(e))?;
 
-    let _ = card.close_buffer(gem_handle);
-
-    Ok(Frame {
-        width,
-        height,
-        data: bgra,
-    })
-}
-
-fn capture_fb1(
-    card: &Card,
-    fb_handle: framebuffer::Handle,
-    width: u32,
-    height: u32,
-) -> Result<Frame> {
-    let info = card.get_framebuffer(fb_handle).context("GET_FB failed")?;
-
-    let gem_handle = info.buffer().with_context(|| {
-        format!(
-            "No buffer handle from GET_FB. \
-             CAP_SYS_ADMIN is required (try: sudo setcap cap_sys_admin+ep {})",
-            exe_path()
-        )
-    })?;
-
-    let pitch = info.pitch();
-    let bpp = info.bpp();
-    let depth = info.depth();
-
-    let format = match (bpp, depth) {
-        (32, 24) => DrmFourcc::Xrgb8888,
-        (32, 32) => DrmFourcc::Argb8888,
-        (16, 16) => DrmFourcc::Rgb565,
-        _ => {
-            let _ = card.close_buffer(gem_handle);
-            bail!("Unsupported framebuffer format: {bpp}bpp depth={depth}");
+        // Evict oldest entry if cache is full
+        if self.cache.len() >= MAX_CACHE_ENTRIES {
+            let evicted = self.cache.remove(0);
+            self.evict_entry(evicted);
         }
-    };
+        self.cache.push(entry);
 
-    let raw = mmap_gem_buffer(card, gem_handle, height, pitch)?;
-    let bgra = pixel_format::convert_to_bgra(&raw, width, height, pitch, format).map_err(|e| {
-        let _ = card.close_buffer(gem_handle);
-        anyhow::anyhow!(e)
-    })?;
+        Ok(result)
+    }
 
-    let _ = card.close_buffer(gem_handle);
-
-    Ok(Frame {
-        width,
-        height,
-        data: bgra,
-    })
-}
-
-fn mmap_gem_buffer(
-    card: &Card,
-    gem_handle: drm::buffer::Handle,
-    height: u32,
-    pitch: u32,
-) -> Result<Vec<u8>> {
-    match mmap_prime(card, gem_handle, height, pitch) {
-        Ok(data) => Ok(data),
-        Err(prime_err) => {
-            tracing::debug!("PRIME mmap failed ({prime_err}), trying dumb buffer mmap");
-            mmap_dumb(card, gem_handle, height, pitch)
+    fn map_buffer(&mut self, fb_handle: framebuffer::Handle) -> Result<CachedBuffer> {
+        // Try FB2 first (gives pixel format), latch choice after first success/failure
+        match self.use_fb2 {
+            Some(true) | None => match self.map_fb2(fb_handle) {
+                Ok(entry) => {
+                    self.use_fb2 = Some(true);
+                    return Ok(entry);
+                }
+                Err(e) => {
+                    if self.use_fb2 == Some(true) {
+                        return Err(e);
+                    }
+                    tracing::debug!("GET_FB2 failed ({e}), trying GET_FB");
+                }
+            },
+            Some(false) => {}
         }
+
+        let entry = self.map_fb1(fb_handle)?;
+        self.use_fb2 = Some(false);
+        Ok(entry)
+    }
+
+    fn map_fb2(&mut self, fb_handle: framebuffer::Handle) -> Result<CachedBuffer> {
+        let info = self
+            .card
+            .get_planar_framebuffer(fb_handle)
+            .context("GET_FB2 failed")?;
+
+        if let Some(modifier) = info.modifier() {
+            if modifier != DrmModifier::Linear {
+                bail!(
+                    "Framebuffer has non-linear modifier ({modifier:?}); \
+                     tiled buffers cannot be read via mmap"
+                );
+            }
+        }
+
+        let gem_handle = info.buffers()[0].context("No buffer handle in framebuffer")?;
+        let pitch = info.pitches()[0];
+        let format = info.pixel_format();
+        tracing::debug!(
+            "FB2: format={format:?}, pitch={pitch}, modifier={:?}",
+            info.modifier()
+        );
+
+        self.map_gem_cached(fb_handle, gem_handle, pitch, format)
+    }
+
+    fn map_fb1(&mut self, fb_handle: framebuffer::Handle) -> Result<CachedBuffer> {
+        let info = self
+            .card
+            .get_framebuffer(fb_handle)
+            .context("GET_FB failed")?;
+
+        let gem_handle = info.buffer().with_context(|| {
+            format!(
+                "No buffer handle from GET_FB. \
+                 CAP_SYS_ADMIN is required (try: sudo setcap cap_sys_admin+ep {})",
+                exe_path()
+            )
+        })?;
+
+        let pitch = info.pitch();
+        let bpp = info.bpp();
+        let depth = info.depth();
+
+        let format = match (bpp, depth) {
+            (32, 24) => DrmFourcc::Xrgb8888,
+            (32, 32) => DrmFourcc::Argb8888,
+            (16, 16) => DrmFourcc::Rgb565,
+            _ => bail!("Unsupported framebuffer format: {bpp}bpp depth={depth}"),
+        };
+
+        self.map_gem_cached(fb_handle, gem_handle, pitch, format)
+    }
+
+    fn map_gem_cached(
+        &mut self,
+        fb_handle: framebuffer::Handle,
+        gem_handle: drm::buffer::Handle,
+        pitch: u32,
+        format: DrmFourcc,
+    ) -> Result<CachedBuffer> {
+        let size = (self.height as usize) * (pitch as usize);
+        let fb_key = u32::from(fb_handle);
+
+        // Try PRIME first, latch choice after first success/failure
+        match self.use_prime {
+            Some(true) | None => {
+                match self.map_prime_cached(fb_key, gem_handle, size, format, pitch) {
+                    Ok(entry) => {
+                        self.use_prime = Some(true);
+                        return Ok(entry);
+                    }
+                    Err(e) => {
+                        if self.use_prime == Some(true) {
+                            return Err(e);
+                        }
+                        tracing::debug!("PRIME mmap failed ({e}), trying dumb buffer mmap");
+                    }
+                }
+            }
+            Some(false) => {}
+        }
+
+        let entry = self.map_dumb_cached(fb_key, gem_handle, size, format, pitch)?;
+        self.use_prime = Some(false);
+        Ok(entry)
+    }
+
+    fn map_prime_cached(
+        &self,
+        fb_key: u32,
+        gem_handle: drm::buffer::Handle,
+        size: usize,
+        format: DrmFourcc,
+        pitch: u32,
+    ) -> Result<CachedBuffer> {
+        let prime_fd: OwnedFd = self
+            .card
+            .buffer_to_prime_fd(gem_handle, drm::RDWR)
+            .context("PRIME export failed")?;
+
+        let ptr = unsafe {
+            mm::mmap(
+                ptr::null_mut(),
+                size,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                &prime_fd,
+                0,
+            )
+            .context("PRIME mmap failed")?
+        };
+
+        Ok(CachedBuffer {
+            fb_key,
+            gem_handle,
+            ptr,
+            size,
+            format,
+            pitch,
+            _prime_fd: Some(prime_fd),
+        })
+    }
+
+    fn map_dumb_cached(
+        &self,
+        fb_key: u32,
+        gem_handle: drm::buffer::Handle,
+        size: usize,
+        format: DrmFourcc,
+        pitch: u32,
+    ) -> Result<CachedBuffer> {
+        let map_result =
+            drm_ffi::mode::dumbbuffer::map(self.card.as_fd(), u32::from(gem_handle), 0, 0)
+                .context("DRM_IOCTL_MODE_MAP_DUMB failed")?;
+
+        let ptr = unsafe {
+            mm::mmap(
+                ptr::null_mut(),
+                size,
+                ProtFlags::READ,
+                MapFlags::SHARED,
+                self.card.as_fd(),
+                map_result.offset,
+            )
+            .context("dumb buffer mmap failed")?
+        };
+
+        Ok(CachedBuffer {
+            fb_key,
+            gem_handle,
+            ptr,
+            size,
+            format,
+            pitch,
+            _prime_fd: None,
+        })
+    }
+
+    fn evict_entry(&self, entry: CachedBuffer) {
+        unsafe {
+            let _ = mm::munmap(entry.ptr, entry.size);
+        }
+        let _ = self.card.close_buffer(entry.gem_handle);
     }
 }
 
-fn mmap_prime(
-    card: &Card,
-    gem_handle: drm::buffer::Handle,
-    height: u32,
-    pitch: u32,
-) -> Result<Vec<u8>> {
-    let prime_fd: OwnedFd = card
-        .buffer_to_prime_fd(gem_handle, drm::RDWR)
-        .context("PRIME export failed")?;
-
-    let size = (height as usize) * (pitch as usize);
-
-    let data = unsafe {
-        let ptr = mm::mmap(
-            ptr::null_mut(),
-            size,
-            ProtFlags::READ,
-            MapFlags::SHARED,
-            &prime_fd,
-            0,
-        )
-        .context("PRIME mmap failed")?;
-
-        let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
-        let buf = slice.to_vec();
-        let _ = mm::munmap(ptr, size);
-        buf
-    };
-
-    Ok(data)
-}
-
-fn mmap_dumb(
-    card: &Card,
-    gem_handle: drm::buffer::Handle,
-    height: u32,
-    pitch: u32,
-) -> Result<Vec<u8>> {
-    let map_result = drm_ffi::mode::dumbbuffer::map(card.as_fd(), u32::from(gem_handle), 0, 0)
-        .context("DRM_IOCTL_MODE_MAP_DUMB failed")?;
-
-    let size = (height as usize) * (pitch as usize);
-
-    let data = unsafe {
-        let ptr = mm::mmap(
-            ptr::null_mut(),
-            size,
-            ProtFlags::READ,
-            MapFlags::SHARED,
-            card.as_fd(),
-            map_result.offset,
-        )
-        .context("dumb buffer mmap failed")?;
-
-        let slice = std::slice::from_raw_parts(ptr.cast::<u8>(), size);
-        let buf = slice.to_vec();
-        let _ = mm::munmap(ptr, size);
-        buf
-    };
-
-    Ok(data)
+impl Drop for Capturer {
+    fn drop(&mut self) {
+        for entry in self.cache.drain(..) {
+            unsafe {
+                let _ = mm::munmap(entry.ptr, entry.size);
+            }
+            let _ = self.card.close_buffer(entry.gem_handle);
+        }
+    }
 }
