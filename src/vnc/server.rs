@@ -188,7 +188,7 @@ fn vnc_des_auth(password: &str, challenge: &[u8; 16]) -> [u8; 16] {
 /// Perform VNC Authentication (Type 2) challenge-response.
 /// Returns Ok(true) if auth succeeded, Ok(false) if failed.
 async fn perform_vnc_auth(stream: &mut TcpStream, password: &str) -> Result<bool> {
-    let challenge: [u8; 16] = rand::thread_rng().gen();
+    let challenge: [u8; 16] = rand::rng().random();
 
     stream
         .write_all(&challenge)
