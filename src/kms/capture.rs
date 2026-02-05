@@ -12,7 +12,8 @@ use super::pixel_format;
 
 fn exe_path() -> String {
     std::env::current_exe()
-        .ok().map(|p| p.display().to_string())
+        .ok()
+        .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<binary>".into())
 }
 
@@ -153,7 +154,12 @@ pub fn capture_frame(card: &Card, output: &ActiveOutput) -> Result<Frame> {
     }
 }
 
-fn capture_fb2(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: u32) -> Result<Frame> {
+fn capture_fb2(
+    card: &Card,
+    fb_handle: framebuffer::Handle,
+    width: u32,
+    height: u32,
+) -> Result<Frame> {
     let info = card
         .get_planar_framebuffer(fb_handle)
         .context("GET_FB2 failed")?;
@@ -170,7 +176,10 @@ fn capture_fb2(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: 
     let gem_handle = info.buffers()[0].context("No buffer handle in framebuffer")?;
     let pitch = info.pitches()[0];
     let format = info.pixel_format();
-    tracing::debug!("FB2: format={format:?}, pitch={pitch}, modifier={:?}", info.modifier());
+    tracing::debug!(
+        "FB2: format={format:?}, pitch={pitch}, modifier={:?}",
+        info.modifier()
+    );
 
     let raw = mmap_gem_buffer(card, gem_handle, height, pitch)?;
     let bgra = pixel_format::convert_to_bgra(&raw, width, height, pitch, format)
@@ -185,10 +194,13 @@ fn capture_fb2(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: 
     })
 }
 
-fn capture_fb1(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: u32) -> Result<Frame> {
-    let info = card
-        .get_framebuffer(fb_handle)
-        .context("GET_FB failed")?;
+fn capture_fb1(
+    card: &Card,
+    fb_handle: framebuffer::Handle,
+    width: u32,
+    height: u32,
+) -> Result<Frame> {
+    let info = card.get_framebuffer(fb_handle).context("GET_FB failed")?;
 
     let gem_handle = info.buffer().with_context(|| {
         format!(
@@ -213,11 +225,10 @@ fn capture_fb1(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: 
     };
 
     let raw = mmap_gem_buffer(card, gem_handle, height, pitch)?;
-    let bgra = pixel_format::convert_to_bgra(&raw, width, height, pitch, format)
-        .map_err(|e| {
-            let _ = card.close_buffer(gem_handle);
-            anyhow::anyhow!(e)
-        })?;
+    let bgra = pixel_format::convert_to_bgra(&raw, width, height, pitch, format).map_err(|e| {
+        let _ = card.close_buffer(gem_handle);
+        anyhow::anyhow!(e)
+    })?;
 
     let _ = card.close_buffer(gem_handle);
 
@@ -228,7 +239,12 @@ fn capture_fb1(card: &Card, fb_handle: framebuffer::Handle, width: u32, height: 
     })
 }
 
-fn mmap_gem_buffer(card: &Card, gem_handle: drm::buffer::Handle, height: u32, pitch: u32) -> Result<Vec<u8>> {
+fn mmap_gem_buffer(
+    card: &Card,
+    gem_handle: drm::buffer::Handle,
+    height: u32,
+    pitch: u32,
+) -> Result<Vec<u8>> {
     match mmap_prime(card, gem_handle, height, pitch) {
         Ok(data) => Ok(data),
         Err(prime_err) => {
@@ -238,7 +254,12 @@ fn mmap_gem_buffer(card: &Card, gem_handle: drm::buffer::Handle, height: u32, pi
     }
 }
 
-fn mmap_prime(card: &Card, gem_handle: drm::buffer::Handle, height: u32, pitch: u32) -> Result<Vec<u8>> {
+fn mmap_prime(
+    card: &Card,
+    gem_handle: drm::buffer::Handle,
+    height: u32,
+    pitch: u32,
+) -> Result<Vec<u8>> {
     let prime_fd: OwnedFd = card
         .buffer_to_prime_fd(gem_handle, drm::RDWR)
         .context("PRIME export failed")?;
@@ -265,7 +286,12 @@ fn mmap_prime(card: &Card, gem_handle: drm::buffer::Handle, height: u32, pitch: 
     Ok(data)
 }
 
-fn mmap_dumb(card: &Card, gem_handle: drm::buffer::Handle, height: u32, pitch: u32) -> Result<Vec<u8>> {
+fn mmap_dumb(
+    card: &Card,
+    gem_handle: drm::buffer::Handle,
+    height: u32,
+    pitch: u32,
+) -> Result<Vec<u8>> {
     let map_result = drm_ffi::mode::dumbbuffer::map(card.as_fd(), u32::from(gem_handle), 0, 0)
         .context("DRM_IOCTL_MODE_MAP_DUMB failed")?;
 

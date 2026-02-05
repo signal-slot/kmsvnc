@@ -26,10 +26,10 @@ fn convert_xrgb8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<V
         let row = &src[(y * pitch) as usize..];
         for x in 0..width as usize {
             let off = x * 4;
-            dst.push(row[off]);     // B
+            dst.push(row[off]); // B
             dst.push(row[off + 1]); // G
             dst.push(row[off + 2]); // R
-            dst.push(0xFF);         // A
+            dst.push(0xFF); // A
         }
     }
     Ok(dst)
@@ -43,10 +43,10 @@ fn convert_argb8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<V
         let row = &src[(y * pitch) as usize..];
         for x in 0..width as usize {
             let off = x * 4;
-            dst.push(row[off]);     // B
+            dst.push(row[off]); // B
             dst.push(row[off + 1]); // G
             dst.push(row[off + 2]); // R
-            dst.push(0xFF);         // A (force opaque)
+            dst.push(0xFF); // A (force opaque)
         }
     }
     Ok(dst)
@@ -62,8 +62,8 @@ fn convert_xbgr8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<V
             let off = x * 4;
             dst.push(row[off + 2]); // B
             dst.push(row[off + 1]); // G
-            dst.push(row[off]);     // R
-            dst.push(0xFF);         // A
+            dst.push(row[off]); // R
+            dst.push(0xFF); // A
         }
     }
     Ok(dst)
@@ -79,8 +79,8 @@ fn convert_abgr8888(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<V
             let off = x * 4;
             dst.push(row[off + 2]); // B
             dst.push(row[off + 1]); // G
-            dst.push(row[off]);     // R
-            dst.push(0xFF);         // A (force opaque)
+            dst.push(row[off]); // R
+            dst.push(0xFF); // A (force opaque)
         }
     }
     Ok(dst)
@@ -103,7 +103,7 @@ fn convert_rgb565(src: &[u8], width: u32, height: u32, pitch: u32) -> Result<Vec
             dst.push((b << 3) | (b >> 2)); // B
             dst.push((g << 2) | (g >> 4)); // G
             dst.push((r << 3) | (r >> 2)); // R
-            dst.push(0xFF);                // A
+            dst.push(0xFF); // A
         }
     }
     Ok(dst)

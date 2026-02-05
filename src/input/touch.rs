@@ -2,8 +2,8 @@ use std::fs::OpenOptions;
 
 use anyhow::{Context, Result};
 use input_linux::{
-    AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, InputId, InputProperty,
-    Key, UInputHandle,
+    AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, InputId, InputProperty, Key,
+    UInputHandle,
 };
 
 /// Virtual touchscreen backed by uinput.
@@ -25,14 +25,28 @@ impl VirtualTouchscreen {
 
         let handle = UInputHandle::new(file);
 
-        handle.set_evbit(EventKind::Absolute).context("set EV_ABS")?;
+        handle
+            .set_evbit(EventKind::Absolute)
+            .context("set EV_ABS")?;
         handle.set_evbit(EventKind::Key).context("set EV_KEY")?;
-        handle.set_keybit(Key::ButtonTouch).context("set BTN_TOUCH")?;
-        handle.set_absbit(AbsoluteAxis::MultitouchSlot).context("set ABS_MT_SLOT")?;
-        handle.set_absbit(AbsoluteAxis::MultitouchTrackingId).context("set ABS_MT_TRACKING_ID")?;
-        handle.set_absbit(AbsoluteAxis::MultitouchPositionX).context("set ABS_MT_POSITION_X")?;
-        handle.set_absbit(AbsoluteAxis::MultitouchPositionY).context("set ABS_MT_POSITION_Y")?;
-        handle.set_propbit(InputProperty::Direct).context("set INPUT_PROP_DIRECT")?;
+        handle
+            .set_keybit(Key::ButtonTouch)
+            .context("set BTN_TOUCH")?;
+        handle
+            .set_absbit(AbsoluteAxis::MultitouchSlot)
+            .context("set ABS_MT_SLOT")?;
+        handle
+            .set_absbit(AbsoluteAxis::MultitouchTrackingId)
+            .context("set ABS_MT_TRACKING_ID")?;
+        handle
+            .set_absbit(AbsoluteAxis::MultitouchPositionX)
+            .context("set ABS_MT_POSITION_X")?;
+        handle
+            .set_absbit(AbsoluteAxis::MultitouchPositionY)
+            .context("set ABS_MT_POSITION_Y")?;
+        handle
+            .set_propbit(InputProperty::Direct)
+            .context("set INPUT_PROP_DIRECT")?;
 
         let id = InputId {
             bustype: 0x06, // BUS_VIRTUAL

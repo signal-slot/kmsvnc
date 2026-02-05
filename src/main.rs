@@ -28,12 +28,7 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let output = &outputs[0];
     let width = output.width;
     let height = output.height;
-    tracing::info!(
-        "Output: {} ({}x{})",
-        output.connector_name,
-        width,
-        height
-    );
+    tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
     let initial = capture::capture_frame(&card, output)?;
     let initial_data = initial.data;
     let capture_fn: CaptureFn = Box::new(move || {
@@ -64,9 +59,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
                 match try_fbdev_capture(path) {
                     Ok(result) => return Ok(result),
                     Err(fb_err) => {
-                        bail!(
-                            "Cannot use {path} as DRM ({drm_err:#}) or fbdev ({fb_err:#})"
-                        );
+                        bail!("Cannot use {path} as DRM ({drm_err:#}) or fbdev ({fb_err:#})");
                     }
                 }
             }
@@ -79,12 +72,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             let output = &outputs[0];
             let width = output.width;
             let height = output.height;
-            tracing::info!(
-                "Output: {} ({}x{})",
-                output.connector_name,
-                width,
-                height
-            );
+            tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
             let initial = capture::capture_frame(&card, output)?;
             let initial_data = initial.data;
             let capture_fn: CaptureFn = Box::new(move || {
@@ -104,11 +92,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("fb"))
-        })
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with("fb")))
         .collect();
     fb_entries.sort_by_key(|e| e.file_name());
 
@@ -160,9 +144,7 @@ async fn main() -> Result<()> {
     });
 
     // Spawn input handler
-    let input_handle = tokio::spawn(async move {
-        input_loop(&mut input_rx, width, height).await
-    });
+    let input_handle = tokio::spawn(async move { input_loop(&mut input_rx, width, height).await });
 
     // Share password across client tasks
     let password = Arc::new(config.password);
@@ -271,11 +253,7 @@ async fn input_loop(input_rx: &mut mpsc::Receiver<InputEvent>, width: u32, heigh
 
     while let Some(event) = input_rx.recv().await {
         match event {
-            InputEvent::Pointer {
-                button_mask,
-                x,
-                y,
-            } => {
+            InputEvent::Pointer { button_mask, x, y } => {
                 if let Some(ref mut t) = touch {
                     if let Err(e) = t.handle_pointer(button_mask, x, y) {
                         tracing::warn!("Touch event error: {e}");

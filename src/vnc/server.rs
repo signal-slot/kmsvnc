@@ -13,15 +13,8 @@ use crate::frame_diff;
 /// Input event forwarded from VNC client to the input subsystem.
 #[derive(Debug, Clone)]
 pub enum InputEvent {
-    Pointer {
-        button_mask: u8,
-        x: u16,
-        y: u16,
-    },
-    Key {
-        down: bool,
-        keysym: u32,
-    },
+    Pointer { button_mask: u8, x: u16, y: u16 },
+    Key { down: bool, keysym: u32 },
 }
 
 /// A dirty rectangle to send to the client.
@@ -101,9 +94,21 @@ fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
         let g = bgra[off + 1] as u32;
         let r = bgra[off + 2] as u32;
 
-        let rs = if pf.red_max == 255 { r } else { r * pf.red_max as u32 / 255 };
-        let gs = if pf.green_max == 255 { g } else { g * pf.green_max as u32 / 255 };
-        let bs = if pf.blue_max == 255 { b } else { b * pf.blue_max as u32 / 255 };
+        let rs = if pf.red_max == 255 {
+            r
+        } else {
+            r * pf.red_max as u32 / 255
+        };
+        let gs = if pf.green_max == 255 {
+            g
+        } else {
+            g * pf.green_max as u32 / 255
+        };
+        let bs = if pf.blue_max == 255 {
+            b
+        } else {
+            b * pf.blue_max as u32 / 255
+        };
 
         let pixel = (rs << pf.red_shift) | (gs << pf.green_shift) | (bs << pf.blue_shift);
 
@@ -139,16 +144,16 @@ fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
 /// true-color, blue at bits 0-7, green at 8-15, red at 16-23.
 /// This matches BGRA byte order in memory.
 const PIXEL_FORMAT: [u8; 16] = [
-    32,   // bits-per-pixel
-    24,   // depth
-    0,    // big-endian-flag (little-endian)
-    1,    // true-colour-flag
+    32, // bits-per-pixel
+    24, // depth
+    0,  // big-endian-flag (little-endian)
+    1,  // true-colour-flag
     0, 255, // red-max (255)
     0, 255, // green-max (255)
     0, 255, // blue-max (255)
-    16,   // red-shift
-    8,    // green-shift
-    0,    // blue-shift
+    16,  // red-shift
+    8,   // green-shift
+    0,   // blue-shift
     0, 0, 0, // padding
 ];
 
@@ -430,7 +435,7 @@ pub async fn handle_client(
             let num_rects = rects.len() as u16;
             let mut hdr = [0u8; 4];
             hdr[0] = 0; // type
-            // hdr[1] = 0; // padding (already zero)
+                        // hdr[1] = 0; // padding (already zero)
             hdr[2..4].copy_from_slice(&num_rects.to_be_bytes());
             writer.write_all(&hdr).await.context("write fb header")?;
 
@@ -536,10 +541,7 @@ async fn read_client_messages(
             // KeyEvent
             4 => {
                 let mut buf = [0u8; 7];
-                reader
-                    .read_exact(&mut buf)
-                    .await
-                    .context("read KeyEvent")?;
+                reader.read_exact(&mut buf).await.context("read KeyEvent")?;
                 let down = buf[0] != 0;
                 let keysym = u32::from_be_bytes([buf[3], buf[4], buf[5], buf[6]]);
                 let _ = input_tx.send(InputEvent::Key { down, keysym }).await;
@@ -555,11 +557,7 @@ async fn read_client_messages(
                 let x = u16::from_be_bytes([buf[1], buf[2]]);
                 let y = u16::from_be_bytes([buf[3], buf[4]]);
                 let _ = input_tx
-                    .send(InputEvent::Pointer {
-                        button_mask,
-                        x,
-                        y,
-                    })
+                    .send(InputEvent::Pointer { button_mask, x, y })
                     .await;
             }
             // ClientCutText

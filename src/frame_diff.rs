@@ -4,12 +4,7 @@ const TILE_SIZE: u32 = 64;
 
 /// Compare two BGRA framebuffers and return dirty rectangles.
 /// If `prev` is `None`, the entire frame is returned as dirty.
-pub fn compute_dirty_rects(
-    prev: Option<&[u8]>,
-    curr: &[u8],
-    width: u32,
-    height: u32,
-) -> Vec<Rect> {
+pub fn compute_dirty_rects(prev: Option<&[u8]>, curr: &[u8], width: u32, height: u32) -> Vec<Rect> {
     let prev = match prev {
         Some(p) if p.len() == curr.len() => p,
         _ => {

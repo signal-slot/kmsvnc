@@ -1,2 +1,2 @@
-pub mod touch;
 pub mod keyboard;
+pub mod touch;
