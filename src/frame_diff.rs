@@ -25,8 +25,8 @@ pub fn compute_dirty_rects(
     };
 
     let stride = (width * 4) as usize;
-    let tiles_x = (width + TILE_SIZE - 1) / TILE_SIZE;
-    let tiles_y = (height + TILE_SIZE - 1) / TILE_SIZE;
+    let tiles_x = width.div_ceil(TILE_SIZE);
+    let tiles_y = height.div_ceil(TILE_SIZE);
 
     let mut rects = Vec::new();
 

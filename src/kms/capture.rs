@@ -12,8 +12,7 @@ use super::pixel_format;
 
 fn exe_path() -> String {
     std::env::current_exe()
-        .ok()
-        .and_then(|p| Some(p.display().to_string()))
+        .ok().map(|p| p.display().to_string())
         .unwrap_or_else(|| "<binary>".into())
 }
 

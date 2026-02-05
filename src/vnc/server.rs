@@ -110,9 +110,9 @@ fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
         match bytes_pp {
             4 => {
                 if pf.big_endian {
-                    out.extend_from_slice(&(pixel as u32).to_be_bytes());
+                    out.extend_from_slice(&pixel.to_be_bytes());
                 } else {
-                    out.extend_from_slice(&(pixel as u32).to_le_bytes());
+                    out.extend_from_slice(&pixel.to_le_bytes());
                 }
             }
             2 => {
@@ -127,7 +127,7 @@ fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
             }
             _ => {
                 // Shouldn't happen with standard VNC clients
-                out.extend_from_slice(&(pixel as u32).to_le_bytes()[..bytes_pp]);
+                out.extend_from_slice(&{ pixel }.to_le_bytes()[..bytes_pp]);
             }
         }
     }
