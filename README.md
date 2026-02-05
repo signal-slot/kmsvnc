@@ -63,8 +63,8 @@ Then connect any VNC client to `localhost:5900`.
 Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
-RUST_LOG=info sudo ./target/release/kmsvnc    # default useful output
-RUST_LOG=debug sudo ./target/release/kmsvnc   # detailed diagnostics
+RUST_LOG=info sudo kmsvnc    # default useful output
+RUST_LOG=debug sudo kmsvnc   # detailed diagnostics
 ```
 
 ## Troubleshooting
@@ -74,7 +74,7 @@ RUST_LOG=debug sudo ./target/release/kmsvnc   # detailed diagnostics
 - Ensure `/dev/dri/card*` devices exist. If not, check that the GPU driver is loaded (`lsmod | grep drm`).
 - The process needs `CAP_SYS_ADMIN` to read framebuffer handles. Run as root or grant the capability:
   ```bash
-  sudo setcap cap_sys_admin+ep ./target/release/kmsvnc
+  sudo setcap cap_sys_admin+ep $(which kmsvnc)
   ```
 
 ### "Framebuffer has non-linear modifier"
@@ -111,7 +111,7 @@ Some DRM drivers (e.g., `simpledrm`, `vkms`) don't support PRIME fd export. kmsv
 If DRM is unavailable (no `/dev/dri/card*` devices, or no GPU driver loaded), kmsvnc falls back to the Linux framebuffer device (`/dev/fb0`). You can also force fbdev explicitly:
 
 ```bash
-sudo ./target/release/kmsvnc --device /dev/fb0
+sudo kmsvnc --device /dev/fb0
 ```
 
 Note: fbdev does not require `CAP_SYS_ADMIN`, but the device file must be readable.
@@ -121,7 +121,7 @@ Note: fbdev does not require `CAP_SYS_ADMIN`, but the device file must be readab
 Another process is using port 5900. Either stop it or use a different port:
 
 ```bash
-./target/release/kmsvnc --port 5901
+kmsvnc --port 5901
 ```
 
 ### Wrong colors in VNC viewer
