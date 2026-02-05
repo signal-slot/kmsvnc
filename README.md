@@ -27,7 +27,7 @@ To build from source, see [BUILDING.md](BUILDING.md).
 
 ```bash
 # Run as root (simplest)
-sudo kmsvnc
+sudo $(which kmsvnc)
 
 # Or grant capabilities
 sudo setcap cap_sys_admin+ep $(which kmsvnc)
@@ -52,8 +52,8 @@ Then connect any VNC client to `localhost:5900`.
 Control log verbosity with the `RUST_LOG` environment variable:
 
 ```bash
-RUST_LOG=info sudo kmsvnc    # default useful output
-RUST_LOG=debug sudo kmsvnc   # detailed diagnostics
+RUST_LOG=info sudo $(which kmsvnc)    # default useful output
+RUST_LOG=debug sudo $(which kmsvnc)   # detailed diagnostics
 ```
 
 ## Limitations

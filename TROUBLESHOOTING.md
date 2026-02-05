@@ -1,5 +1,13 @@
 # Troubleshooting
 
+## `sudo: kmsvnc: command not found`
+
+`sudo` uses a restricted `secure_path` that typically doesn't include `~/.cargo/bin`. Use `$(which kmsvnc)` to resolve the full path before passing it to sudo:
+
+```bash
+sudo $(which kmsvnc)
+```
+
 ## "No DRI card with active outputs found"
 
 - Ensure `/dev/dri/card*` devices exist. If not, check that the GPU driver is loaded (`lsmod | grep drm`).
