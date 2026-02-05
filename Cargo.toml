@@ -2,6 +2,9 @@
 name = "kmsvnc"
 version = "0.1.0"
 edition = "2021"
+description = "A KMS/DRM-based VNC server for Linux"
+license = "MIT"
+repository = "https://github.com/signal-slot/kmsvnc"
 
 [dependencies]
 drm = "0.14"

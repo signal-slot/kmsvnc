@@ -25,7 +25,7 @@ A lightweight VNC server for Linux that captures the screen directly from the KM
 ## Installation
 
 ```bash
-cargo install --git https://github.com/signal-slot/kmsvnc.git
+cargo install kmsvnc
 ```
 
 Or build from a local checkout:
