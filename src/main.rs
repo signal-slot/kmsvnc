@@ -8,7 +8,7 @@ use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -198,45 +198,106 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Adaptive capture mode: switches between on-demand and polling based on request frequency.
+enum CaptureMode {
+    /// Wait for explicit capture requests; always force-capture to ensure fresh frames.
+    OnDemand,
+    /// Actively poll at the given interval; skip unchanged frames to save CPU.
+    Polling { interval: Duration },
+}
+
 fn capture_loop(
     mut capture_fn: CaptureFn,
     frame_tx: watch::Sender<Arc<Vec<u8>>>,
     capture_req_rx: std_mpsc::Receiver<()>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let mut mode = CaptureMode::OnDemand;
+    let mut last_request_time: Option<Instant> = None;
+    let mut fast_request_count = 0u32;
+
     loop {
-        // Wait for a capture request or timeout to check shutdown
-        match capture_req_rx.recv_timeout(Duration::from_millis(100)) {
+        let timeout = match mode {
+            CaptureMode::OnDemand => Duration::from_millis(100),
+            CaptureMode::Polling { interval } => interval,
+        };
+
+        match capture_req_rx.recv_timeout(timeout) {
             Ok(()) => {
+                // Check request interval to detect high-frequency clients
+                let now = Instant::now();
+                if let Some(last) = last_request_time {
+                    if now.duration_since(last) < Duration::from_millis(100) {
+                        fast_request_count += 1;
+                        if fast_request_count >= 3 {
+                            if matches!(mode, CaptureMode::OnDemand) {
+                                tracing::debug!("Switching to polling mode");
+                            }
+                            mode = CaptureMode::Polling {
+                                interval: Duration::from_millis(16), // ~60fps
+                            };
+                        }
+                    } else {
+                        fast_request_count = 0;
+                    }
+                }
+                last_request_time = Some(now);
+
                 // Drain any additional queued requests (coalesce)
                 while capture_req_rx.try_recv().is_ok() {}
 
-                match capture_fn(false) {
-                    Ok(Some(data)) => {
-                        if frame_tx.send(Arc::new(data)).is_err() {
-                            break; // All receivers dropped
-                        }
-                    }
-                    Ok(None) => {
-                        // Frame unchanged — notify waiters with current frame
-                        frame_tx.send_modify(|_| {});
-                    }
-                    Err(e) => {
-                        tracing::warn!("Capture failed: {e}");
-                        frame_tx.send_modify(|_| {});
-                    }
-                }
+                // On-demand mode: always force=true for fresh frames
+                // Polling mode: force=false, unchanged frames are skipped
+                let force = matches!(mode, CaptureMode::OnDemand);
+                do_capture(&mut capture_fn, &frame_tx, force);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                if shutdown.load(Ordering::Relaxed) {
-                    tracing::debug!("Capture loop shutting down");
-                    break;
+                match mode {
+                    CaptureMode::Polling { .. } => {
+                        // Check if we should switch back to on-demand
+                        if let Some(last) = last_request_time {
+                            if Instant::now().duration_since(last) > Duration::from_millis(500) {
+                                tracing::debug!("Switching to on-demand mode");
+                                mode = CaptureMode::OnDemand;
+                                fast_request_count = 0;
+                            } else {
+                                // Continue polling: capture periodically
+                                do_capture(&mut capture_fn, &frame_tx, false);
+                            }
+                        }
+                    }
+                    CaptureMode::OnDemand => {
+                        // Just check for shutdown
+                        if shutdown.load(Ordering::Relaxed) {
+                            tracing::debug!("Capture loop shutting down");
+                            break;
+                        }
+                    }
                 }
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::debug!("Capture request channel closed");
                 break;
             }
+        }
+    }
+}
+
+/// Perform a capture and send the result if a new frame was obtained.
+fn do_capture(
+    capture_fn: &mut CaptureFn,
+    frame_tx: &watch::Sender<Arc<Vec<u8>>>,
+    force: bool,
+) {
+    match capture_fn(force) {
+        Ok(Some(data)) => {
+            let _ = frame_tx.send(Arc::new(data));
+        }
+        Ok(None) => {
+            // Frame unchanged — don't notify (polling mode only; next capture comes soon)
+        }
+        Err(e) => {
+            tracing::warn!("Capture failed: {e}");
         }
     }
 }
