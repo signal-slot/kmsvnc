@@ -175,7 +175,8 @@ impl Capturer {
         }
     }
 
-    pub fn capture(&mut self) -> Result<Option<Vec<u8>>> {
+    /// Capture a frame. If `force` is true, always capture regardless of fb_handle.
+    pub fn capture(&mut self, force: bool) -> Result<Option<Vec<u8>>> {
         let crtc_info = self
             .card
             .get_crtc(self.crtc_handle)
@@ -184,7 +185,7 @@ impl Capturer {
         let fb_key = u32::from(fb_handle);
 
         // Skip capture if fb_handle hasn't changed (same page-flip buffer)
-        if self.last_fb_key == Some(fb_key) {
+        if !force && self.last_fb_key == Some(fb_key) {
             return Ok(None);
         }
         self.last_fb_key = Some(fb_key);

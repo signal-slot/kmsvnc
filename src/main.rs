@@ -6,8 +6,9 @@ mod vnc;
 
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -20,7 +21,8 @@ use kms::fbdev::FbdevCapture;
 use vnc::server::{self, InputEvent};
 
 /// A boxed capture function: each call returns one BGRA frame, or `None` if unchanged.
-type CaptureFn = Box<dyn FnMut() -> Result<Option<Vec<u8>>> + Send>;
+/// If `force` is true, always capture regardless of whether the framebuffer changed.
+type CaptureFn = Box<dyn FnMut(bool) -> Result<Option<Vec<u8>>> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
@@ -31,9 +33,9 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
     let mut capturer = capture::Capturer::new(card, output);
     let initial_data = capturer
-        .capture()?
+        .capture(true)?
         .expect("first capture must produce a frame");
-    let capture_fn: CaptureFn = Box::new(move || capturer.capture());
+    let capture_fn: CaptureFn = Box::new(move |force| capturer.capture(force));
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -43,7 +45,7 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let width = fbdev.width();
     let height = fbdev.height();
     let initial_data = fbdev.capture_frame()?;
-    let capture_fn: CaptureFn = Box::new(move || Ok(Some(fbdev.capture_frame()?)));
+    let capture_fn: CaptureFn = Box::new(move |_force| Ok(Some(fbdev.capture_frame()?)));
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -74,9 +76,9 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
             let mut capturer = capture::Capturer::new(card, output);
             let initial_data = capturer
-                .capture()?
+                .capture(true)?
                 .expect("first capture must produce a frame");
-            let capture_fn: CaptureFn = Box::new(move || capturer.capture());
+            let capture_fn: CaptureFn = Box::new(move |force| capturer.capture(force));
             return Ok((width, height, initial_data, capture_fn));
         }
         Err(drm_err) => {
@@ -128,6 +130,9 @@ async fn main() -> Result<()> {
     // Frame channel: latest full BGRA buffer
     let (frame_tx, frame_rx) = watch::channel(Arc::new(initial_data));
 
+    // Capture request channel: VNC clients signal when they need a frame
+    let (capture_req_tx, capture_req_rx) = std_mpsc::channel::<()>();
+
     // Input event channel
     let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(256);
 
@@ -135,10 +140,9 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_capture = shutdown.clone();
 
-    // Spawn capture loop
-    let fps = config.fps;
+    // Spawn capture loop (on-demand, driven by client requests)
     let capture_handle = tokio::task::spawn_blocking(move || {
-        capture_loop(capture_fn, frame_tx, fps, shutdown_capture)
+        capture_loop(capture_fn, frame_tx, capture_req_rx, shutdown_capture)
     });
 
     // Spawn input handler
@@ -168,12 +172,13 @@ async fn main() -> Result<()> {
                 let (stream, peer) = accept?;
                 tracing::info!("VNC client connected: {peer}");
                 let frame_rx = frame_rx.clone();
+                let capture_req_tx = capture_req_tx.clone();
                 let input_tx = input_tx.clone();
                 let password = password.clone();
                 let w = width as u16;
                 let h = height as u16;
                 tokio::spawn(async move {
-                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, input_tx, password.as_deref()).await {
+                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, capture_req_tx, input_tx, password.as_deref()).await {
                         tracing::info!("Client {peer} disconnected: {e}");
                     }
                 });
@@ -196,39 +201,42 @@ async fn main() -> Result<()> {
 fn capture_loop(
     mut capture_fn: CaptureFn,
     frame_tx: watch::Sender<Arc<Vec<u8>>>,
-    fps: u32,
+    capture_req_rx: std_mpsc::Receiver<()>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let frame_interval = Duration::from_micros(1_000_000 / fps as u64);
-
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            tracing::debug!("Capture loop shutting down");
-            break;
-        }
+        // Wait for a capture request or timeout to check shutdown
+        match capture_req_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(()) => {
+                // Drain any additional queued requests (coalesce)
+                while capture_req_rx.try_recv().is_ok() {}
 
-        let start = Instant::now();
-
-        match capture_fn() {
-            Ok(Some(data)) => {
-                // Send full frame; receivers do their own diffing
-                if frame_tx.send(Arc::new(data)).is_err() {
-                    break; // All receivers dropped
+                match capture_fn(false) {
+                    Ok(Some(data)) => {
+                        if frame_tx.send(Arc::new(data)).is_err() {
+                            break; // All receivers dropped
+                        }
+                    }
+                    Ok(None) => {
+                        // Frame unchanged — notify waiters with current frame
+                        frame_tx.send_modify(|_| {});
+                    }
+                    Err(e) => {
+                        tracing::warn!("Capture failed: {e}");
+                        frame_tx.send_modify(|_| {});
+                    }
                 }
             }
-            Ok(None) => {
-                // Frame unchanged — skip send, VNC clients stay blocked on changed()
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if shutdown.load(Ordering::Relaxed) {
+                    tracing::debug!("Capture loop shutting down");
+                    break;
+                }
             }
-            Err(e) => {
-                tracing::warn!("Capture failed: {e}");
-                // Notify watchers so they don't block forever on changed()
-                frame_tx.send_modify(|_| {});
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::debug!("Capture request channel closed");
+                break;
             }
-        }
-
-        let elapsed = start.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
         }
     }
 }

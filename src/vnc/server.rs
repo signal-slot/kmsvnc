@@ -211,6 +211,7 @@ pub async fn handle_client(
     width: u16,
     height: u16,
     mut frame_rx: watch::Receiver<Arc<Vec<u8>>>,
+    capture_req_tx: std::sync::mpsc::Sender<()>,
     input_tx: mpsc::Sender<InputEvent>,
     password: Option<&str>,
 ) -> Result<()> {
@@ -401,7 +402,8 @@ pub async fn handle_client(
             };
 
             if incremental {
-                // Wait for a new frame from the capture loop
+                // Request a capture and wait for a new frame
+                let _ = capture_req_tx.send(());
                 if frame_rx.changed().await.is_err() {
                     return Ok(());
                 }
