@@ -389,7 +389,7 @@ pub async fn handle_client(
     });
 
     // Writer: each client tracks its own prev-sent buffer for diffing
-    let mut prev_sent: Option<Vec<u8>> = None;
+    let mut prev_sent: Option<Arc<Vec<u8>>> = None;
     let w32 = width as u32;
     let h32 = height as u32;
 
@@ -413,7 +413,7 @@ pub async fn handle_client(
             let frame = frame_rx.borrow_and_update().clone();
 
             let rects = if incremental {
-                frame_diff::compute_dirty_rects(prev_sent.as_deref(), &frame, w32, h32)
+                frame_diff::compute_dirty_rects(prev_sent.as_ref().map(|v| v.as_slice()), &frame, w32, h32)
             } else {
                 // Non-incremental: full frame
                 vec![Rect {
@@ -425,7 +425,7 @@ pub async fn handle_client(
                 }]
             };
 
-            prev_sent = Some((*frame).clone());
+            prev_sent = Some(frame.clone());
 
             // Get current client pixel format
             let pf = pf_rx.borrow().clone();

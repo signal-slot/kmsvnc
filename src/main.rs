@@ -19,8 +19,8 @@ use kms::capture;
 use kms::fbdev::FbdevCapture;
 use vnc::server::{self, InputEvent};
 
-/// A boxed capture function: each call returns one BGRA frame.
-type CaptureFn = Box<dyn FnMut() -> Result<Vec<u8>> + Send>;
+/// A boxed capture function: each call returns one BGRA frame, or `None` if unchanged.
+type CaptureFn = Box<dyn FnMut() -> Result<Option<Vec<u8>>> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
@@ -30,7 +30,9 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let height = output.height;
     tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
     let mut capturer = capture::Capturer::new(card, output);
-    let initial_data = capturer.capture()?;
+    let initial_data = capturer
+        .capture()?
+        .expect("first capture must produce a frame");
     let capture_fn: CaptureFn = Box::new(move || capturer.capture());
     Ok((width, height, initial_data, capture_fn))
 }
@@ -41,7 +43,7 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let width = fbdev.width();
     let height = fbdev.height();
     let initial_data = fbdev.capture_frame()?;
-    let capture_fn: CaptureFn = Box::new(move || fbdev.capture_frame());
+    let capture_fn: CaptureFn = Box::new(move || Ok(Some(fbdev.capture_frame()?)));
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -71,7 +73,9 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             let height = output.height;
             tracing::info!("Output: {} ({}x{})", output.connector_name, width, height);
             let mut capturer = capture::Capturer::new(card, output);
-            let initial_data = capturer.capture()?;
+            let initial_data = capturer
+                .capture()?
+                .expect("first capture must produce a frame");
             let capture_fn: CaptureFn = Box::new(move || capturer.capture());
             return Ok((width, height, initial_data, capture_fn));
         }
@@ -206,11 +210,14 @@ fn capture_loop(
         let start = Instant::now();
 
         match capture_fn() {
-            Ok(data) => {
+            Ok(Some(data)) => {
                 // Send full frame; receivers do their own diffing
                 if frame_tx.send(Arc::new(data)).is_err() {
                     break; // All receivers dropped
                 }
+            }
+            Ok(None) => {
+                // Frame unchanged — skip send, VNC clients stay blocked on changed()
             }
             Err(e) => {
                 tracing::warn!("Capture failed: {e}");

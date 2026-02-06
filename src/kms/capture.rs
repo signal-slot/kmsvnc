@@ -153,6 +153,7 @@ pub struct Capturer {
     use_fb2: Option<bool>,
     use_prime: Option<bool>,
     cache: Vec<CachedBuffer>,
+    last_fb_key: Option<u32>,
 }
 
 // SAFETY: The mmap pointers in CachedBuffer are read-only and their backing
@@ -169,17 +170,24 @@ impl Capturer {
             use_fb2: None,
             use_prime: None,
             cache: Vec::new(),
+            last_fb_key: None,
             card,
         }
     }
 
-    pub fn capture(&mut self) -> Result<Vec<u8>> {
+    pub fn capture(&mut self) -> Result<Option<Vec<u8>>> {
         let crtc_info = self
             .card
             .get_crtc(self.crtc_handle)
             .context("Failed to get CRTC")?;
         let fb_handle = crtc_info.framebuffer().unwrap_or(self.default_fb);
         let fb_key = u32::from(fb_handle);
+
+        // Skip capture if fb_handle hasn't changed (same page-flip buffer)
+        if self.last_fb_key == Some(fb_key) {
+            return Ok(None);
+        }
+        self.last_fb_key = Some(fb_key);
 
         // Cache hit — read directly from persistent mmap
         if let Some(entry) = self.cache.iter().find(|e| e.fb_key == fb_key) {
@@ -192,7 +200,8 @@ impl Capturer {
                 entry.pitch,
                 entry.format,
             )
-            .map_err(|e| anyhow::anyhow!(e));
+            .map_err(|e| anyhow::anyhow!(e))
+            .map(Some);
         }
 
         // Cache miss — map the buffer
@@ -214,7 +223,7 @@ impl Capturer {
         }
         self.cache.push(entry);
 
-        Ok(result)
+        Ok(Some(result))
     }
 
     fn map_buffer(&mut self, fb_handle: framebuffer::Handle) -> Result<CachedBuffer> {
