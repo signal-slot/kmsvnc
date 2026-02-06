@@ -18,6 +18,10 @@ impl ControlDevice for Card {}
 impl Card {
     pub fn open(path: &str) -> std::io::Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
-        Ok(Card(file))
+        let card = Card(file);
+        // Release DRM master so other apps (e.g. EGLFS) can acquire it.
+        // kmsvnc only reads framebuffers and doesn't need master privileges.
+        let _ = card.release_master_lock();
+        Ok(card)
     }
 }
