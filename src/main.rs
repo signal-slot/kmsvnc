@@ -246,10 +246,8 @@ fn capture_loop(
                 // Drain any additional queued requests (coalesce)
                 while capture_req_rx.try_recv().is_ok() {}
 
-                // On-demand mode: always force=true for fresh frames
-                // Polling mode: force=false, unchanged frames are skipped
-                let force = matches!(mode, CaptureMode::OnDemand);
-                do_capture(&mut capture_fn, &frame_tx, force);
+                // Client request: always force=true to guarantee a fresh frame
+                do_capture(&mut capture_fn, &frame_tx, true);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 match mode {
