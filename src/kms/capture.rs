@@ -190,19 +190,27 @@ impl Capturer {
         }
         self.last_fb_key = Some(fb_key);
 
-        // Cache hit — read directly from persistent mmap
-        if let Some(entry) = self.cache.iter().find(|e| e.fb_key == fb_key) {
-            let raw =
-                unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
-            return pixel_format::convert_to_bgra(
-                raw,
-                self.width,
-                self.height,
-                entry.pitch,
-                entry.format,
-            )
-            .map_err(|e| anyhow::anyhow!(e))
-            .map(Some);
+        // Cache hit — verify GEM handle still matches (fb_handle may be recycled)
+        if let Some(idx) = self.cache.iter().position(|e| e.fb_key == fb_key) {
+            let current_gem = self.get_gem_handle(fb_handle)?;
+            if self.cache[idx].gem_handle == current_gem {
+                let entry = &self.cache[idx];
+                let raw =
+                    unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
+                return pixel_format::convert_to_bgra(
+                    raw,
+                    self.width,
+                    self.height,
+                    entry.pitch,
+                    entry.format,
+                )
+                .map_err(|e| anyhow::anyhow!(e))
+                .map(Some);
+            }
+            // fb_handle was recycled — evict stale entry
+            tracing::debug!("fb_handle {fb_key} recycled (gem changed), evicting stale cache");
+            let evicted = self.cache.remove(idx);
+            self.evict_entry(evicted);
         }
 
         // Cache miss — map the buffer
@@ -225,6 +233,28 @@ impl Capturer {
         self.cache.push(entry);
 
         Ok(Some(result))
+    }
+
+    /// Get the current GEM handle for a framebuffer, to detect fb_handle recycling.
+    fn get_gem_handle(&self, fb_handle: framebuffer::Handle) -> Result<drm::buffer::Handle> {
+        match self.use_fb2 {
+            Some(true) | None => {
+                if let Ok(info) = self.card.get_planar_framebuffer(fb_handle) {
+                    if let Some(gem) = info.buffers()[0] {
+                        return Ok(gem);
+                    }
+                }
+                if self.use_fb2 == Some(true) {
+                    bail!("GET_FB2 failed for gem handle query");
+                }
+            }
+            Some(false) => {}
+        }
+        let info = self
+            .card
+            .get_framebuffer(fb_handle)
+            .context("GET_FB failed for gem handle query")?;
+        info.buffer().context("No buffer handle from GET_FB")
     }
 
     fn map_buffer(&mut self, fb_handle: framebuffer::Handle) -> Result<CachedBuffer> {
