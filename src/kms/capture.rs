@@ -11,6 +11,8 @@ use rustix::mm::{self, MapFlags, ProtFlags};
 use super::card::Card;
 use super::pixel_format;
 
+use crate::frame_diff::DirtyTiles;
+
 fn exe_path() -> String {
     std::env::current_exe()
         .ok()
@@ -177,7 +179,17 @@ impl Capturer {
 
     /// Capture a frame into a caller-provided buffer.
     /// Returns `true` if a new frame was captured, `false` if unchanged.
-    pub fn capture_into(&mut self, dst: &mut Vec<u8>, force: bool) -> Result<bool> {
+    ///
+    /// When `dirty_tiles` is provided AND the buffer already contains a previous
+    /// frame (same size), uses incremental tile-by-tile copy for direct-copy
+    /// formats (XRGB8888/ARGB8888). Only changed tiles are copied and marked
+    /// dirty, avoiding the full-frame memcpy + separate memcmp.
+    pub fn capture_into(
+        &mut self,
+        dst: &mut Vec<u8>,
+        force: bool,
+        dirty_tiles: Option<&DirtyTiles>,
+    ) -> Result<bool> {
         let crtc_info = self
             .card
             .get_crtc(self.crtc_handle)
@@ -202,30 +214,13 @@ impl Capturer {
             let entry = &self.cache[idx];
             let raw =
                 unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
-            pixel_format::convert_to_bgra_into(
-                dst,
-                raw,
-                self.width,
-                self.height,
-                entry.pitch,
-                entry.format,
-            )
-            .map_err(|e| anyhow::anyhow!(e))?;
-            return Ok(true);
+            return self.convert_or_incremental(dst, raw, entry.format, entry.pitch, dirty_tiles);
         }
 
         // Cache miss — map the buffer
         let entry = self.map_buffer(fb_handle)?;
         let raw = unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
-        pixel_format::convert_to_bgra_into(
-            dst,
-            raw,
-            self.width,
-            self.height,
-            entry.pitch,
-            entry.format,
-        )
-        .map_err(|e| anyhow::anyhow!(e))?;
+        let result = self.convert_full(dst, raw, entry.format, entry.pitch, dirty_tiles);
 
         // Evict oldest entry if cache is full
         if self.cache.len() >= MAX_CACHE_ENTRIES {
@@ -234,13 +229,55 @@ impl Capturer {
         }
         self.cache.push(entry);
 
+        result
+    }
+
+    /// Try incremental copy if possible, otherwise fall back to full copy.
+    fn convert_or_incremental(
+        &self,
+        dst: &mut Vec<u8>,
+        raw: &[u8],
+        format: DrmFourcc,
+        pitch: u32,
+        dirty_tiles: Option<&DirtyTiles>,
+    ) -> Result<bool> {
+        let expected_size = (self.width * self.height * 4) as usize;
+
+        // Incremental path: direct-copy format + warm buffer + dirty_tiles available
+        if let Some(dt) = dirty_tiles {
+            if pixel_format::is_direct_copy(format) && dst.len() == expected_size {
+                let changed = pixel_format::copy_rows_incremental(
+                    dst, raw, self.width, self.height, pitch, dt,
+                );
+                return Ok(changed);
+            }
+        }
+
+        // Full copy fallback
+        self.convert_full(dst, raw, format, pitch, dirty_tiles)
+    }
+
+    /// Full pixel format conversion. Marks all tiles dirty.
+    fn convert_full(
+        &self,
+        dst: &mut Vec<u8>,
+        raw: &[u8],
+        format: DrmFourcc,
+        pitch: u32,
+        dirty_tiles: Option<&DirtyTiles>,
+    ) -> Result<bool> {
+        pixel_format::convert_to_bgra_into(dst, raw, self.width, self.height, pitch, format)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        if let Some(dt) = dirty_tiles {
+            dt.set_all();
+        }
         Ok(true)
     }
 
     /// Capture a frame. If `force` is true, always capture regardless of fb_handle.
     pub fn capture(&mut self, force: bool) -> Result<Option<Vec<u8>>> {
         let mut dst = Vec::new();
-        if self.capture_into(&mut dst, force)? {
+        if self.capture_into(&mut dst, force, None)? {
             Ok(Some(dst))
         } else {
             Ok(None)

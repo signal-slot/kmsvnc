@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
-use crate::frame_diff;
+use crate::frame_diff::{self, DirtyTiles};
 
 /// Input event forwarded from VNC client to the input subsystem.
 #[derive(Debug, Clone)]
@@ -202,6 +202,7 @@ pub async fn handle_client(
     capture_req_tx: std::sync::mpsc::Sender<()>,
     input_tx: mpsc::Sender<InputEvent>,
     password: Option<&str>,
+    dirty_tiles: Arc<DirtyTiles>,
 ) -> Result<()> {
     // === RFB Handshake ===
 
@@ -378,10 +379,6 @@ pub async fn handle_client(
         r
     });
 
-    // Writer: each client tracks its own prev-sent buffer for diffing
-    let mut prev_sent: Option<Arc<Vec<u8>>> = None;
-    let w32 = width as u32;
-    let h32 = height as u32;
     let stride = width as usize * 4;
 
     // Reusable buffer for pixel format conversion
@@ -408,9 +405,19 @@ pub async fn handle_client(
             let frame = frame_rx.borrow_and_update().clone();
 
             let rects = if incremental {
-                frame_diff::compute_dirty_rects(prev_sent.as_ref().map(|v| v.as_slice()), &frame, w32, h32)
+                // Drain accumulated dirty tiles set by the capture thread
+                let rects = dirty_tiles.drain_to_rects();
+                if rects.is_empty() {
+                    // Nothing changed — send empty FramebufferUpdate (0 rects)
+                    // to satisfy the client's request per RFB protocol
+                    writer.write_all(&[0, 0, 0, 0]).await.context("write empty fb")?;
+                    writer.flush().await.ok();
+                    continue;
+                }
+                rects
             } else {
                 // Non-incremental: full frame
+                dirty_tiles.drain_to_rects(); // clear any stale bits
                 vec![frame_diff::DirtyRect {
                     x: 0,
                     y: 0,
@@ -418,8 +425,6 @@ pub async fn handle_client(
                     height,
                 }]
             };
-
-            prev_sent = Some(frame.clone());
 
             // Get current client pixel format
             let pf = pf_rx.borrow().clone();

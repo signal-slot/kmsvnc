@@ -1,5 +1,53 @@
 use drm_fourcc::DrmFourcc;
 
+use crate::frame_diff::{DirtyTiles, TILE_SIZE};
+
+/// Returns true if format is direct-copy (mmap bytes == BGRA output bytes).
+pub fn is_direct_copy(format: DrmFourcc) -> bool {
+    matches!(format, DrmFourcc::Xrgb8888 | DrmFourcc::Argb8888)
+}
+
+/// Incremental copy for direct-copy formats (XRGB8888/ARGB8888).
+/// Compares mmap `src` with `dst` (previous frame) in row-first order,
+/// reading mmap sequentially left-to-right within each row. This access
+/// pattern is critical for uncached GPU mmap where bus burst efficiency
+/// depends on sequential reads.
+/// Only copies tile segments that differ. Sets dirty bits in `dirty_tiles`.
+/// Returns true if any tile changed.
+pub fn copy_rows_incremental(
+    dst: &mut [u8],
+    src: &[u8],
+    width: u32,
+    height: u32,
+    pitch: u32,
+    dirty_tiles: &DirtyTiles,
+) -> bool {
+    let row_bytes = (width * 4) as usize;
+    let tiles_x = width.div_ceil(TILE_SIZE) as usize;
+    let mut any_dirty = false;
+
+    for y in 0..height {
+        let src_row = (y * pitch) as usize;
+        let dst_row = y as usize * row_bytes;
+        let ty = (y / TILE_SIZE) as usize;
+
+        for tx in 0..tiles_x {
+            let x0 = tx * TILE_SIZE as usize * 4;
+            let tw = (TILE_SIZE.min(width - tx as u32 * TILE_SIZE) * 4) as usize;
+
+            if dst[dst_row + x0..dst_row + x0 + tw]
+                != src[src_row + x0..src_row + x0 + tw]
+            {
+                dst[dst_row + x0..dst_row + x0 + tw]
+                    .copy_from_slice(&src[src_row + x0..src_row + x0 + tw]);
+                dirty_tiles.set(ty * tiles_x + tx);
+                any_dirty = true;
+            }
+        }
+    }
+    any_dirty
+}
+
 /// Convert raw framebuffer pixels to BGRA8888 format into a caller-provided buffer.
 /// The buffer is cleared and resized as needed.
 pub fn convert_to_bgra_into(

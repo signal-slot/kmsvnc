@@ -16,14 +16,16 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 
 use config::Config;
+use frame_diff::DirtyTiles;
 use kms::capture;
 use kms::fbdev::FbdevCapture;
 use vnc::server::{self, InputEvent};
 
 /// A boxed capture function: writes one BGRA frame into the provided buffer.
 /// Returns `true` if a new frame was captured, `false` if unchanged.
-/// If `force` is true, always capture regardless of whether the framebuffer changed.
-type CaptureFn = Box<dyn FnMut(bool, &mut Vec<u8>) -> Result<bool> + Send>;
+/// `dirty_tiles` is provided for incremental tile-level capture.
+type CaptureFn =
+    Box<dyn FnMut(bool, &mut Vec<u8>, Option<&DirtyTiles>) -> Result<bool> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
@@ -36,7 +38,8 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let initial_data = capturer
         .capture(true)?
         .expect("first capture must produce a frame");
-    let capture_fn: CaptureFn = Box::new(move |force, dst| capturer.capture_into(dst, force));
+    let capture_fn: CaptureFn =
+        Box::new(move |force, dst, dt| capturer.capture_into(dst, force, dt));
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -46,7 +49,7 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let width = fbdev.width();
     let height = fbdev.height();
     let initial_data = fbdev.capture_frame()?;
-    let capture_fn: CaptureFn = Box::new(move |_force, dst| {
+    let capture_fn: CaptureFn = Box::new(move |_force, dst, _dt| {
         fbdev.capture_frame_into(dst)?;
         Ok(true)
     });
@@ -83,7 +86,7 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
                 .capture(true)?
                 .expect("first capture must produce a frame");
             let capture_fn: CaptureFn =
-                Box::new(move |force, dst| capturer.capture_into(dst, force));
+                Box::new(move |force, dst, dt| capturer.capture_into(dst, force, dt));
             return Ok((width, height, initial_data, capture_fn));
         }
         Err(drm_err) => {
@@ -132,6 +135,9 @@ async fn main() -> Result<()> {
 
     let (width, height, initial_data, capture_fn) = setup_capture(&config)?;
 
+    // Shared dirty tile accumulator between capture thread and VNC server
+    let dirty_tiles = Arc::new(DirtyTiles::new(width, height));
+
     // Frame channel: latest full BGRA buffer
     let (frame_tx, frame_rx) = watch::channel(Arc::new(initial_data));
 
@@ -146,10 +152,18 @@ async fn main() -> Result<()> {
     let shutdown_capture = shutdown.clone();
 
     let fps = config.fps;
+    let dirty_tiles_capture = dirty_tiles.clone();
 
     // Spawn capture loop (on-demand, driven by client requests)
     let capture_handle = tokio::task::spawn_blocking(move || {
-        capture_loop(capture_fn, frame_tx, capture_req_rx, shutdown_capture, fps)
+        capture_loop(
+            capture_fn,
+            frame_tx,
+            capture_req_rx,
+            shutdown_capture,
+            fps,
+            dirty_tiles_capture,
+        )
     });
 
     // Spawn input handler
@@ -182,10 +196,11 @@ async fn main() -> Result<()> {
                 let capture_req_tx = capture_req_tx.clone();
                 let input_tx = input_tx.clone();
                 let password = password.clone();
+                let dirty_tiles = dirty_tiles.clone();
                 let w = width as u16;
                 let h = height as u16;
                 tokio::spawn(async move {
-                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, capture_req_tx, input_tx, password.as_deref()).await {
+                    if let Err(e) = server::handle_client(stream, w, h, frame_rx, capture_req_tx, input_tx, password.as_deref(), dirty_tiles).await {
                         tracing::info!("Client {peer} disconnected: {e}");
                     }
                 });
@@ -219,6 +234,7 @@ fn capture_loop(
     capture_req_rx: std_mpsc::Receiver<()>,
     shutdown: Arc<AtomicBool>,
     fps: u32,
+    dirty_tiles: Arc<DirtyTiles>,
 ) {
     let poll_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let mut mode = CaptureMode::OnDemand;
@@ -258,8 +274,10 @@ fn capture_loop(
                 // Drain any additional queued requests (coalesce)
                 while capture_req_rx.try_recv().is_ok() {}
 
-                // Client request: always force=true to guarantee a fresh frame
-                do_capture(&mut capture_fn, &frame_tx, true, &mut reuse_buf);
+                // Client request: force=false allows skipping mmap when fb_handle
+                // unchanged (no page flip). The GEM handle cache fix ensures
+                // stale frames are never returned.
+                do_capture(&mut capture_fn, &frame_tx, false, &mut reuse_buf, &dirty_tiles);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 match mode {
@@ -272,7 +290,13 @@ fn capture_loop(
                                 fast_request_count = 0;
                             } else {
                                 // Continue polling: capture periodically
-                                do_capture(&mut capture_fn, &frame_tx, false, &mut reuse_buf);
+                                do_capture(
+                                    &mut capture_fn,
+                                    &frame_tx,
+                                    false,
+                                    &mut reuse_buf,
+                                    &dirty_tiles,
+                                );
                             }
                         }
                     }
@@ -299,11 +323,12 @@ fn do_capture(
     frame_tx: &watch::Sender<Arc<Vec<u8>>>,
     force: bool,
     reuse_buf: &mut Option<Vec<u8>>,
+    dirty_tiles: &DirtyTiles,
 ) {
     // Try to reclaim the buffer from the previous Arc (if refcount == 1)
     let mut buf = reuse_buf.take().unwrap_or_default();
 
-    match capture_fn(force, &mut buf) {
+    match capture_fn(force, &mut buf, Some(dirty_tiles)) {
         Ok(true) => {
             let new_arc = Arc::new(buf);
             let old_arc = frame_tx.send_replace(new_arc);
@@ -313,7 +338,9 @@ fn do_capture(
             }
         }
         Ok(false) => {
-            // Frame unchanged — keep buf for next capture
+            // Frame unchanged — notify VNC server to unblock changed().await
+            // (no dirty tiles set, so server sends empty FramebufferUpdate)
+            frame_tx.send_modify(|_| {});
             *reuse_buf = Some(buf);
         }
         Err(e) => {
