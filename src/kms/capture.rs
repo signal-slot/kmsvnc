@@ -175,8 +175,9 @@ impl Capturer {
         }
     }
 
-    /// Capture a frame. If `force` is true, always capture regardless of fb_handle.
-    pub fn capture(&mut self, force: bool) -> Result<Option<Vec<u8>>> {
+    /// Capture a frame into a caller-provided buffer.
+    /// Returns `true` if a new frame was captured, `false` if unchanged.
+    pub fn capture_into(&mut self, dst: &mut Vec<u8>, force: bool) -> Result<bool> {
         let crtc_info = self
             .card
             .get_crtc(self.crtc_handle)
@@ -186,37 +187,38 @@ impl Capturer {
 
         // Skip capture if fb_handle hasn't changed (same page-flip buffer)
         if !force && self.last_fb_key == Some(fb_key) {
-            return Ok(None);
+            return Ok(false);
         }
         self.last_fb_key = Some(fb_key);
 
-        // Cache hit — verify GEM handle still matches (fb_handle may be recycled)
-        if let Some(idx) = self.cache.iter().position(|e| e.fb_key == fb_key) {
-            let current_gem = self.get_gem_handle(fb_handle)?;
-            if self.cache[idx].gem_handle == current_gem {
-                let entry = &self.cache[idx];
-                let raw =
-                    unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
-                return pixel_format::convert_to_bgra(
-                    raw,
-                    self.width,
-                    self.height,
-                    entry.pitch,
-                    entry.format,
-                )
-                .map_err(|e| anyhow::anyhow!(e))
-                .map(Some);
-            }
-            // fb_handle was recycled — evict stale entry
-            tracing::debug!("fb_handle {fb_key} recycled (gem changed), evicting stale cache");
-            let evicted = self.cache.remove(idx);
-            self.evict_entry(evicted);
+        // Get the current GEM handle (the true identity of the buffer)
+        let current_gem = self.get_gem_handle(fb_handle)?;
+
+        // Cache lookup by GEM handle — supports double/triple buffering where
+        // the same fb_handle maps to rotating GEM objects.
+        if let Some(idx) = self.cache.iter().position(|e| e.gem_handle == current_gem) {
+            // Update fb_key in case it changed (fb_handle recycling detection)
+            self.cache[idx].fb_key = fb_key;
+            let entry = &self.cache[idx];
+            let raw =
+                unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
+            pixel_format::convert_to_bgra_into(
+                dst,
+                raw,
+                self.width,
+                self.height,
+                entry.pitch,
+                entry.format,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+            return Ok(true);
         }
 
         // Cache miss — map the buffer
         let entry = self.map_buffer(fb_handle)?;
         let raw = unsafe { std::slice::from_raw_parts(entry.ptr.cast::<u8>(), entry.size) };
-        let result = pixel_format::convert_to_bgra(
+        pixel_format::convert_to_bgra_into(
+            dst,
             raw,
             self.width,
             self.height,
@@ -232,7 +234,17 @@ impl Capturer {
         }
         self.cache.push(entry);
 
-        Ok(Some(result))
+        Ok(true)
+    }
+
+    /// Capture a frame. If `force` is true, always capture regardless of fb_handle.
+    pub fn capture(&mut self, force: bool) -> Result<Option<Vec<u8>>> {
+        let mut dst = Vec::new();
+        if self.capture_into(&mut dst, force)? {
+            Ok(Some(dst))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Get the current GEM handle for a framebuffer, to detect fb_handle recycling.

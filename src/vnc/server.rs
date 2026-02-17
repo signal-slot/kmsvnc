@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use cipher::{BlockEncrypt, KeyInit};
 use des::Des;
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 
@@ -15,17 +15,6 @@ use crate::frame_diff;
 pub enum InputEvent {
     Pointer { button_mask: u8, x: u16, y: u16 },
     Key { down: bool, keysym: u32 },
-}
-
-/// A dirty rectangle to send to the client.
-#[derive(Clone)]
-pub struct Rect {
-    pub x: u16,
-    pub y: u16,
-    pub width: u16,
-    pub height: u16,
-    /// BGRA pixel data for this rectangle, row-major.
-    pub data: Vec<u8>,
 }
 
 /// Client-negotiated pixel format.
@@ -82,17 +71,19 @@ impl ClientPixelFormat {
     }
 }
 
-/// Convert BGRA pixel data to the client's requested pixel format.
-fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
+/// Convert one row of BGRA pixel data to the client's requested pixel format.
+/// Reuses `out` buffer to avoid per-row allocation.
+fn convert_row_into(bgra_row: &[u8], pf: &ClientPixelFormat, out: &mut Vec<u8>) {
     let bytes_pp = (pf.bpp / 8) as usize;
-    let num_pixels = bgra.len() / 4;
-    let mut out = Vec::with_capacity(num_pixels * bytes_pp);
+    let num_pixels = bgra_row.len() / 4;
+    out.clear();
+    out.reserve(num_pixels * bytes_pp);
 
     for i in 0..num_pixels {
         let off = i * 4;
-        let b = bgra[off] as u32;
-        let g = bgra[off + 1] as u32;
-        let r = bgra[off + 2] as u32;
+        let b = bgra_row[off] as u32;
+        let g = bgra_row[off + 1] as u32;
+        let r = bgra_row[off + 2] as u32;
 
         let rs = if pf.red_max == 255 {
             r
@@ -131,13 +122,10 @@ fn convert_pixels(bgra: &[u8], pf: &ClientPixelFormat) -> Vec<u8> {
                 out.push(pixel as u8);
             }
             _ => {
-                // Shouldn't happen with standard VNC clients
                 out.extend_from_slice(&{ pixel }.to_le_bytes()[..bytes_pp]);
             }
         }
     }
-
-    out
 }
 
 /// Server-side pixel format: 32bpp, depth 24, little-endian,
@@ -377,7 +365,8 @@ pub async fn handle_client(
 
     // === Message loop ===
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
+    let mut writer = BufWriter::new(writer);
     let (update_req_tx, mut update_req_rx) = mpsc::channel::<bool>(4);
     let (pf_tx, pf_rx) = watch::channel(ClientPixelFormat::server_default());
 
@@ -393,6 +382,10 @@ pub async fn handle_client(
     let mut prev_sent: Option<Arc<Vec<u8>>> = None;
     let w32 = width as u32;
     let h32 = height as u32;
+    let stride = width as usize * 4;
+
+    // Reusable buffer for pixel format conversion
+    let mut convert_buf = Vec::new();
 
     let writer_loop = async {
         loop {
@@ -418,12 +411,11 @@ pub async fn handle_client(
                 frame_diff::compute_dirty_rects(prev_sent.as_ref().map(|v| v.as_slice()), &frame, w32, h32)
             } else {
                 // Non-incremental: full frame
-                vec![Rect {
+                vec![frame_diff::DirtyRect {
                     x: 0,
                     y: 0,
                     width,
                     height,
-                    data: (*frame).clone(),
                 }]
             };
 
@@ -437,7 +429,6 @@ pub async fn handle_client(
             let num_rects = rects.len() as u16;
             let mut hdr = [0u8; 4];
             hdr[0] = 0; // type
-                        // hdr[1] = 0; // padding (already zero)
             hdr[2..4].copy_from_slice(&num_rects.to_be_bytes());
             writer.write_all(&hdr).await.context("write fb header")?;
 
@@ -450,17 +441,24 @@ pub async fn handle_client(
                 rhdr[8..12].copy_from_slice(&0i32.to_be_bytes()); // Raw encoding
                 writer.write_all(&rhdr).await.context("write rect header")?;
 
-                if need_convert {
-                    let converted = convert_pixels(&rect.data, &pf);
-                    writer
-                        .write_all(&converted)
-                        .await
-                        .context("write rect data")?;
-                } else {
-                    writer
-                        .write_all(&rect.data)
-                        .await
-                        .context("write rect data")?;
+                // Write tile data directly from frame buffer, row by row
+                for row in rect.y..rect.y + rect.height {
+                    let start = row as usize * stride + rect.x as usize * 4;
+                    let end = start + rect.width as usize * 4;
+                    let bgra_row = &frame[start..end];
+
+                    if need_convert {
+                        convert_row_into(bgra_row, &pf, &mut convert_buf);
+                        writer
+                            .write_all(&convert_buf)
+                            .await
+                            .context("write rect data")?;
+                    } else {
+                        writer
+                            .write_all(bgra_row)
+                            .await
+                            .context("write rect data")?;
+                    }
                 }
             }
 

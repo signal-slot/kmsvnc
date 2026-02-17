@@ -190,7 +190,7 @@ impl FbdevCapture {
         self.height
     }
 
-    pub fn capture_frame(&self) -> Result<Vec<u8>> {
+    pub fn capture_frame_into(&self, dst: &mut Vec<u8>) -> Result<()> {
         let bpp = match self.format {
             DrmFourcc::Rgb565 => 2u32,
             _ => 4u32,
@@ -215,8 +215,14 @@ impl FbdevCapture {
             std::slice::from_raw_parts(base, needed)
         };
 
-        pixel_format::convert_to_bgra(raw, self.width, self.height, self.stride, self.format)
+        pixel_format::convert_to_bgra_into(dst, raw, self.width, self.height, self.stride, self.format)
             .map_err(|e| anyhow::anyhow!(e))
+    }
+
+    pub fn capture_frame(&self) -> Result<Vec<u8>> {
+        let mut dst = Vec::new();
+        self.capture_frame_into(&mut dst)?;
+        Ok(dst)
     }
 }
 

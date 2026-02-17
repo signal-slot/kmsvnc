@@ -20,9 +20,10 @@ use kms::capture;
 use kms::fbdev::FbdevCapture;
 use vnc::server::{self, InputEvent};
 
-/// A boxed capture function: each call returns one BGRA frame, or `None` if unchanged.
+/// A boxed capture function: writes one BGRA frame into the provided buffer.
+/// Returns `true` if a new frame was captured, `false` if unchanged.
 /// If `force` is true, always capture regardless of whether the framebuffer changed.
-type CaptureFn = Box<dyn FnMut(bool) -> Result<Option<Vec<u8>>> + Send>;
+type CaptureFn = Box<dyn FnMut(bool, &mut Vec<u8>) -> Result<bool> + Send>;
 
 /// Try to set up DRM capture for a specific card path.
 fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
@@ -35,7 +36,7 @@ fn try_drm_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let initial_data = capturer
         .capture(true)?
         .expect("first capture must produce a frame");
-    let capture_fn: CaptureFn = Box::new(move |force| capturer.capture(force));
+    let capture_fn: CaptureFn = Box::new(move |force, dst| capturer.capture_into(dst, force));
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -45,7 +46,10 @@ fn try_fbdev_capture(path: &str) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
     let width = fbdev.width();
     let height = fbdev.height();
     let initial_data = fbdev.capture_frame()?;
-    let capture_fn: CaptureFn = Box::new(move |_force| Ok(Some(fbdev.capture_frame()?)));
+    let capture_fn: CaptureFn = Box::new(move |_force, dst| {
+        fbdev.capture_frame_into(dst)?;
+        Ok(true)
+    });
     Ok((width, height, initial_data, capture_fn))
 }
 
@@ -78,7 +82,8 @@ fn setup_capture(config: &Config) -> Result<(u32, u32, Vec<u8>, CaptureFn)> {
             let initial_data = capturer
                 .capture(true)?
                 .expect("first capture must produce a frame");
-            let capture_fn: CaptureFn = Box::new(move |force| capturer.capture(force));
+            let capture_fn: CaptureFn =
+                Box::new(move |force, dst| capturer.capture_into(dst, force));
             return Ok((width, height, initial_data, capture_fn));
         }
         Err(drm_err) => {
@@ -140,9 +145,11 @@ async fn main() -> Result<()> {
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_capture = shutdown.clone();
 
+    let fps = config.fps;
+
     // Spawn capture loop (on-demand, driven by client requests)
     let capture_handle = tokio::task::spawn_blocking(move || {
-        capture_loop(capture_fn, frame_tx, capture_req_rx, shutdown_capture)
+        capture_loop(capture_fn, frame_tx, capture_req_rx, shutdown_capture, fps)
     });
 
     // Spawn input handler
@@ -211,10 +218,15 @@ fn capture_loop(
     frame_tx: watch::Sender<Arc<Vec<u8>>>,
     capture_req_rx: std_mpsc::Receiver<()>,
     shutdown: Arc<AtomicBool>,
+    fps: u32,
 ) {
+    let poll_interval = Duration::from_millis(1000 / fps.max(1) as u64);
     let mut mode = CaptureMode::OnDemand;
     let mut last_request_time: Option<Instant> = None;
     let mut fast_request_count = 0u32;
+
+    // Buffer pool: try to reuse the Vec from the previous Arc
+    let mut reuse_buf: Option<Vec<u8>> = None;
 
     loop {
         let timeout = match mode {
@@ -231,10 +243,10 @@ fn capture_loop(
                         fast_request_count += 1;
                         if fast_request_count >= 3 {
                             if matches!(mode, CaptureMode::OnDemand) {
-                                tracing::debug!("Switching to polling mode");
+                                tracing::debug!("Switching to polling mode ({}fps)", fps);
                             }
                             mode = CaptureMode::Polling {
-                                interval: Duration::from_millis(16), // ~60fps
+                                interval: poll_interval,
                             };
                         }
                     } else {
@@ -247,7 +259,7 @@ fn capture_loop(
                 while capture_req_rx.try_recv().is_ok() {}
 
                 // Client request: always force=true to guarantee a fresh frame
-                do_capture(&mut capture_fn, &frame_tx, true);
+                do_capture(&mut capture_fn, &frame_tx, true, &mut reuse_buf);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 match mode {
@@ -260,7 +272,7 @@ fn capture_loop(
                                 fast_request_count = 0;
                             } else {
                                 // Continue polling: capture periodically
-                                do_capture(&mut capture_fn, &frame_tx, false);
+                                do_capture(&mut capture_fn, &frame_tx, false, &mut reuse_buf);
                             }
                         }
                     }
@@ -286,16 +298,28 @@ fn do_capture(
     capture_fn: &mut CaptureFn,
     frame_tx: &watch::Sender<Arc<Vec<u8>>>,
     force: bool,
+    reuse_buf: &mut Option<Vec<u8>>,
 ) {
-    match capture_fn(force) {
-        Ok(Some(data)) => {
-            let _ = frame_tx.send(Arc::new(data));
+    // Try to reclaim the buffer from the previous Arc (if refcount == 1)
+    let mut buf = reuse_buf.take().unwrap_or_default();
+
+    match capture_fn(force, &mut buf) {
+        Ok(true) => {
+            let new_arc = Arc::new(buf);
+            let old_arc = frame_tx.send_replace(new_arc);
+            // Try to reclaim the old buffer for next frame
+            if let Ok(old_vec) = Arc::try_unwrap(old_arc) {
+                *reuse_buf = Some(old_vec);
+            }
         }
-        Ok(None) => {
-            // Frame unchanged — don't notify (polling mode only; next capture comes soon)
+        Ok(false) => {
+            // Frame unchanged — keep buf for next capture
+            *reuse_buf = Some(buf);
         }
         Err(e) => {
             tracing::warn!("Capture failed: {e}");
+            // Keep buf for next attempt
+            *reuse_buf = Some(buf);
         }
     }
 }
