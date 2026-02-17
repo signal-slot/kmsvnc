@@ -244,10 +244,19 @@ fn capture_loop(
     // Buffer pool: try to reuse the Vec from the previous Arc
     let mut reuse_buf: Option<Vec<u8>> = None;
 
+    // Idle backoff: reduce capture rate when screen content is unchanged.
+    // Consecutive unchanged captures increase idle_streak; any change resets it.
+    let mut idle_streak = 0u32;
+
     loop {
         let timeout = match mode {
             CaptureMode::OnDemand => Duration::from_millis(100),
-            CaptureMode::Polling { interval } => interval,
+            CaptureMode::Polling { interval } => {
+                // Exponential backoff when idle: double interval every 5 unchanged
+                // captures, up to 4x the base interval.
+                let shift = (idle_streak / 5).min(2);
+                interval * (1 << shift)
+            }
         };
 
         match capture_req_rx.recv_timeout(timeout) {
@@ -274,10 +283,24 @@ fn capture_loop(
                 // Drain any additional queued requests (coalesce)
                 while capture_req_rx.try_recv().is_ok() {}
 
-                // Client request: force=false allows skipping mmap when fb_handle
-                // unchanged (no page flip). The GEM handle cache fix ensures
-                // stale frames are never returned.
-                do_capture(&mut capture_fn, &frame_tx, false, &mut reuse_buf, &dirty_tiles);
+                match mode {
+                    CaptureMode::OnDemand => {
+                        // On-demand: capture immediately on each client request
+                        do_capture(
+                            &mut capture_fn,
+                            &frame_tx,
+                            false,
+                            &mut reuse_buf,
+                            &dirty_tiles,
+                        );
+                    }
+                    CaptureMode::Polling { .. } => {
+                        // Polling: timer drives captures — don't capture here.
+                        // The VNC server will get the response on the next timer tick.
+                        // This prevents double-captures (timer + request) which
+                        // effectively doubled the capture rate.
+                    }
+                }
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 match mode {
@@ -288,15 +311,21 @@ fn capture_loop(
                                 tracing::debug!("Switching to on-demand mode");
                                 mode = CaptureMode::OnDemand;
                                 fast_request_count = 0;
+                                idle_streak = 0;
                             } else {
-                                // Continue polling: capture periodically
-                                do_capture(
+                                // Timer-driven capture with idle backoff
+                                let changed = do_capture(
                                     &mut capture_fn,
                                     &frame_tx,
                                     false,
                                     &mut reuse_buf,
                                     &dirty_tiles,
                                 );
+                                if changed {
+                                    idle_streak = 0;
+                                } else {
+                                    idle_streak = idle_streak.saturating_add(1);
+                                }
                             }
                         }
                     }
@@ -318,13 +347,14 @@ fn capture_loop(
 }
 
 /// Perform a capture and send the result if a new frame was obtained.
+/// Returns `true` if the frame content actually changed.
 fn do_capture(
     capture_fn: &mut CaptureFn,
     frame_tx: &watch::Sender<Arc<Vec<u8>>>,
     force: bool,
     reuse_buf: &mut Option<Vec<u8>>,
     dirty_tiles: &DirtyTiles,
-) {
+) -> bool {
     // Try to reclaim the buffer from the previous Arc (if refcount == 1)
     let mut buf = reuse_buf.take().unwrap_or_default();
 
@@ -336,17 +366,20 @@ fn do_capture(
             if let Ok(old_vec) = Arc::try_unwrap(old_arc) {
                 *reuse_buf = Some(old_vec);
             }
+            true
         }
         Ok(false) => {
             // Frame unchanged — notify VNC server to unblock changed().await
             // (no dirty tiles set, so server sends empty FramebufferUpdate)
             frame_tx.send_modify(|_| {});
             *reuse_buf = Some(buf);
+            false
         }
         Err(e) => {
             tracing::warn!("Capture failed: {e}");
             // Keep buf for next attempt
             *reuse_buf = Some(buf);
+            false
         }
     }
 }

@@ -367,7 +367,7 @@ pub async fn handle_client(
     // === Message loop ===
 
     let (reader, writer) = stream.into_split();
-    let mut writer = BufWriter::new(writer);
+    let mut writer = BufWriter::with_capacity(65536, writer);
     let (update_req_tx, mut update_req_rx) = mpsc::channel::<bool>(4);
     let (pf_tx, pf_rx) = watch::channel(ClientPixelFormat::server_default());
 
