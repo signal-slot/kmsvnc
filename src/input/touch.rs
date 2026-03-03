@@ -1,4 +1,5 @@
 use std::fs::OpenOptions;
+use std::io::Write;
 
 use anyhow::{Context, Result};
 use input_linux::{
@@ -141,6 +142,17 @@ impl VirtualTouchscreen {
         Ok(())
     }
 
+    fn write_events(&self, events: &[input_linux::sys::input_event]) -> Result<()> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                events.as_ptr() as *const u8,
+                std::mem::size_of_val(events),
+            )
+        };
+        self.handle.as_inner().write_all(bytes).context("write events to uinput")?;
+        Ok(())
+    }
+
     fn touch_down(&self, x: u16, y: u16) -> Result<()> {
         let events = [
             make_event(EV_ABS, ABS_MT_SLOT, 0),
@@ -150,8 +162,7 @@ impl VirtualTouchscreen {
             make_event(EV_KEY, BTN_TOUCH, 1),
             make_event(EV_SYN, SYN_REPORT, 0),
         ];
-        self.handle.write(&events).context("write touch_down")?;
-        Ok(())
+        self.write_events(&events)
     }
 
     fn touch_move(&self, x: u16, y: u16) -> Result<()> {
@@ -161,8 +172,7 @@ impl VirtualTouchscreen {
             make_event(EV_ABS, ABS_MT_POSITION_Y, y as i32),
             make_event(EV_SYN, SYN_REPORT, 0),
         ];
-        self.handle.write(&events).context("write touch_move")?;
-        Ok(())
+        self.write_events(&events)
     }
 
     fn touch_up(&self) -> Result<()> {
@@ -172,8 +182,7 @@ impl VirtualTouchscreen {
             make_event(EV_KEY, BTN_TOUCH, 0),
             make_event(EV_SYN, SYN_REPORT, 0),
         ];
-        self.handle.write(&events).context("write touch_up")?;
-        Ok(())
+        self.write_events(&events)
     }
 }
 
